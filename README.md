@@ -33,6 +33,9 @@ python main.py --source video/japan.mp4 --save output/japan.mp4
 ```bash
 python main.py --source video/highway.mp4 --save output/highway.mp4
 ```
+```bash
+python main.py --source video/s_us.mp4 --save output/s_us.mp4
+```
 
 Optional: show preview window:
 ```bash
