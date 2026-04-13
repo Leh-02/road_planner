@@ -1,3 +1,8 @@
+import os
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import cv2
 import numpy as np
 import torch
@@ -9,9 +14,18 @@ class RoadSegmenter:
     def __init__(self, model_id: str, device: str | None = None, max_side: int | None = None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.max_side = int(max_side) if max_side and max_side > 0 else None
+        self.model_id = model_id
 
-        self.processor = AutoImageProcessor.from_pretrained(model_id)
-        self.model = SegformerForSemanticSegmentation.from_pretrained(model_id).to(self.device)
+        self.processor = AutoImageProcessor.from_pretrained(
+            model_id,
+            use_fast=False,
+            local_files_only=True,
+        )
+        self.model = SegformerForSemanticSegmentation.from_pretrained(
+            model_id,
+            local_files_only=True,
+            use_safetensors=False,
+        ).to(self.device)
         self.model.eval()
 
         self.road_id = None
@@ -47,7 +61,10 @@ class RoadSegmenter:
         out = self.model(**inputs)
         logits = out.logits
         logits = torch.nn.functional.interpolate(
-            logits, size=frame_small.shape[:2], mode="bilinear", align_corners=False
+            logits,
+            size=frame_small.shape[:2],
+            mode="bilinear",
+            align_corners=False,
         )
 
         pred = logits.argmax(dim=1)[0].detach().cpu().numpy().astype(np.uint8)
