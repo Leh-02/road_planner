@@ -17,6 +17,7 @@ class Config:
     # --- YOLO ---
     yolo_model: str = "yolov8n.pt"
     yolo_conf: float = 0.35
+    yolo_imgsz: int = 960
     obstacle_names: tuple[str, ...] = ("person", "bicycle", "motorcycle", "car", "bus", "truck")
 
     # --- Central road selection ---
@@ -27,62 +28,57 @@ class Config:
     # --- Grid / planning ---
     cell: int = 8
     inflate_cells: int = 2
-    goal_y_ratio: float = 0.25
-    start_search_rows_up: int = 12
-    astar_w_clear: float = 1.05
-    astar_w_turn: float = 0.06
-    goal_continuity_penalty: float = 0.020
+    goal_y_ratio: float = 0.22
+    start_search_rows_up: int = 16
+    astar_w_clear: float = 1.35
+    astar_w_turn: float = 0.04
+    goal_continuity_penalty: float = 0.004
+    path_clearance_penalty: float = 24.0
 
-    # --- Branch / lateral path sampling ---
+    # --- Goal sampling ---
     max_branches: int = 5
     branch_min_width_cells: int = 6
-    branch_center_limit_ratio: float = 0.42
+    branch_multi_path_min_width_cells: int = 14
+    branch_side_sample_ratio: float = 0.22
     branch_label_deadband_cells: int = 2
-    branch_edge_margin_cells: int = 3
-    branch_multi_path_min_width_cells: int = 12
-    branch_quartile_path_min_width_cells: int = 20
-    branch_side_offset_ratio: float = 0.22
-    branch_side_offset_min_cells: int = 4
 
     # --- Obstacle avoidance ---
-    avoid_roi_y1_ratio: float = 0.35
+    avoid_roi_y1_ratio: float = 0.30
     avoid_roi_y2_ratio: float = 0.98
-    lookahead_row_ratio: float = 0.70
+    lookahead_row_ratio: float = 0.68
     keep_avoid_until_clear: bool = True
-    blocking_obstacle_bottom_px: int = 300
-    obstacle_goal_margin_cells: int = 6
-    obstacle_goal_penalty: float = 4.5
+    blocking_obstacle_bottom_px: int = 420
+    obstacle_goal_margin_cells: int = 8
+    obstacle_goal_penalty: float = 9.0
 
     # --- Lane-change / focus vehicle ---
-    lane_change_trigger_bottom_px: int = 220
-    lane_change_center_band_ratio: float = 0.60
-    lane_change_probe_up_cells: int = 9
+    lane_change_trigger_bottom_px: int = 320
+    lane_change_center_band_ratio: float = 0.85
+    lane_change_probe_up_cells: int = 12
     lane_change_vehicle_names: tuple[str, ...] = ("car", "bus", "truck", "motorcycle")
-    lane_change_block_half_width_cells: int = 7
-    lane_change_vehicle_center_penalty: float = 6.5
-    lane_change_hold_frames: int = 10
+    lane_change_hold_frames: int = 16
+    center_goal_penalty: float = 16.0
+    wrong_side_penalty: float = 42.0
 
     # --- Visualization ---
     road_mask_color: tuple[int, int, int] = (0, 255, 0)
-    road_mask_alpha: float = 0.18
+    road_mask_alpha: float = 0.16
     obstacle_mask_color: tuple[int, int, int] = (0, 0, 255)
-    obstacle_mask_alpha: float = 0.18
+    obstacle_mask_alpha: float = 0.20
 
-    best_path_resample_points: int = 34
-    candidate_resample_points: int = 24
-    centerline_smooth_alpha: float = 0.76
+    best_path_resample_points: int = 32
+    centerline_smooth_alpha: float = 0.35
 
-    corridor_start_half_width_px: int = 96
-    corridor_end_half_width_px: int = 20
-    corridor_alpha: float = 0.28
+    corridor_start_half_width_px: int = 88
+    corridor_end_half_width_px: int = 18
+    corridor_alpha: float = 0.34
     best_corridor_fill_color: tuple[int, int, int] = (255, 140, 0)
     best_corridor_edge_color: tuple[int, int, int] = (255, 255, 255)
-    best_path_text_color: tuple[int, int, int] = (255, 220, 0)
+    best_corridor_center_color: tuple[int, int, int] = (0, 255, 255)
+    best_path_text_color: tuple[int, int, int] = (0, 255, 255)
     best_corridor_edge_thickness_px: int = 3
+    best_corridor_center_thickness_px: int = 4
+    arrow_thickness_px: int = 5
 
-    candidate_corridor_start_half_width_px: int = 62
-    candidate_corridor_end_half_width_px: int = 14
-    candidate_corridor_alpha: float = 0.18
-    candidate_corridor_fill_color: tuple[int, int, int] = (0, 220, 255)
-    candidate_corridor_edge_color: tuple[int, int, int] = (80, 255, 255)
-    candidate_corridor_edge_thickness_px: int = 2
+    # corridor visibility
+    clip_best_corridor_to_road: bool = False

@@ -18,6 +18,7 @@ from utils.visualization import (
     smooth_polyline,
     draw_guidance_corridor,
     draw_focus_vehicle,
+    draw_direction_arrow,
 )
 from utils.state import PlannerState
 
@@ -37,116 +38,6 @@ def segments_from_row_free(row_free: np.ndarray):
     return segs
 
 
-def rank_segments(segs, center_c: int):
-    ranked = []
-    for c1, c2 in segs:
-        width = c2 - c1 + 1
-        seg_center = (c1 + c2) // 2
-        contains_center = c1 <= center_c <= c2
-        dist = 0 if contains_center else abs(seg_center - center_c)
-        ranked.append((0 if contains_center else 1, dist, -width, c1, c2))
-    ranked.sort()
-    return [(c1, c2) for _, _, _, c1, c2 in ranked]
-
-
-def generate_cols_in_segment(c1: int, c2: int, anchor_c: int, cfg: Config):
-    width = c2 - c1 + 1
-    margin = min(cfg.branch_edge_margin_cells, max(0, width // 3))
-    inner_l = min(max(c1 + margin, c1), c2)
-    inner_r = max(min(c2 - margin, c2), c1)
-    if inner_l > inner_r:
-        inner_l, inner_r = c1, c2
-
-    anchor = int(np.clip(anchor_c, inner_l, inner_r))
-    cols = [anchor]
-
-    if width >= cfg.branch_multi_path_min_width_cells:
-        side_offset = max(cfg.branch_side_offset_min_cells, int(round(width * cfg.branch_side_offset_ratio)))
-        cols.append(int(np.clip(anchor - side_offset, inner_l, inner_r)))
-        cols.append(int(np.clip(anchor + side_offset, inner_l, inner_r)))
-
-    if width >= cfg.branch_quartile_path_min_width_cells:
-        q1 = int(round(c1 + width * 0.30))
-        q3 = int(round(c1 + width * 0.70))
-        cols.extend([
-            int(np.clip(q1, inner_l, inner_r)),
-            int(np.clip(q3, inner_l, inner_r)),
-        ])
-
-    out = []
-    for c in cols:
-        if c not in out:
-            out.append(c)
-    return out
-
-
-def choose_branches(grid, scan_r, center_c, cfg: Config, prefer_c=None):
-    row_free = (grid[scan_r] == 0)
-    segs = segments_from_row_free(row_free)
-    segs = [(c1, c2) for (c1, c2) in segs if (c2 - c1 + 1) >= cfg.branch_min_width_cells]
-    if not segs:
-        return [center_c]
-
-    center_limit = int(cfg.branch_center_limit_ratio * grid.shape[1])
-    segs = [
-        (c1, c2) for (c1, c2) in segs
-        if abs(((c1 + c2) // 2) - center_c) <= center_limit or (c1 <= center_c <= c2)
-    ] or segs
-
-    ranked = rank_segments(segs, center_c)
-    if not ranked:
-        return [center_c]
-
-    if prefer_c is None:
-        prefer_c = center_c
-
-    cols = []
-    primary = ranked[0]
-    primary_anchor = prefer_c if primary[0] <= prefer_c <= primary[1] else center_c
-    cols.extend(generate_cols_in_segment(primary[0], primary[1], primary_anchor, cfg))
-
-    for c1, c2 in ranked[1:]:
-        seg_center = (c1 + c2) // 2
-        if seg_center not in cols:
-            cols.append(seg_center)
-
-    cols.sort(key=lambda c: (abs(c - prefer_c), abs(c - center_c)))
-
-    out = []
-    for c in cols:
-        if c not in out:
-            out.append(c)
-        if len(out) >= cfg.max_branches:
-            break
-
-    return out or [center_c]
-
-
-def obstacle_present_in_roi(obst_mask_u8, cfg: Config):
-    h, _ = obst_mask_u8.shape[:2]
-    y1 = int(h * cfg.avoid_roi_y1_ratio)
-    y2 = int(h * cfg.avoid_roi_y2_ratio)
-    roi = obst_mask_u8[y1:y2, :]
-    return roi.mean() > 1.0
-
-
-def pick_avoid_side(grid, look_r, center_c):
-    free = (grid[look_r] == 0)
-    if not free.any():
-        return None
-
-    segs = segments_from_row_free(free)
-    segs.sort(key=lambda s: abs(((s[0] + s[1]) // 2) - center_c))
-    c1, c2 = segs[0]
-
-    left_w = max(0, center_c - c1)
-    right_w = max(0, c2 - center_c)
-    if left_w == right_w == 0:
-        return None
-
-    return "left" if left_w >= right_w else "right"
-
-
 def pick_start_cell(grid: np.ndarray, center_c: int, max_rows_up: int = 12):
     gh, gw = grid.shape
     center_c = int(np.clip(center_c, 0, gw - 1))
@@ -163,6 +54,22 @@ def pick_start_cell(grid: np.ndarray, center_c: int, max_rows_up: int = 12):
         return int(r), int(free_cols[idx])
 
     return bottom_r, center_c
+
+
+def path_side_name(col: int, center_c: int, deadband_cells: int = 2):
+    if col < center_c - deadband_cells:
+        return "LEFT"
+    if col > center_c + deadband_cells:
+        return "RIGHT"
+    return "CENTER"
+
+
+def obstacle_present_in_roi(obst_mask_u8: np.ndarray, cfg: Config):
+    h, _ = obst_mask_u8.shape[:2]
+    y1 = int(h * cfg.avoid_roi_y1_ratio)
+    y2 = int(h * cfg.avoid_roi_y2_ratio)
+    roi = obst_mask_u8[y1:y2, :]
+    return roi.mean() > 1.0
 
 
 def pick_focus_vehicle(boxes, names_dict, frame_hw, cfg: Config):
@@ -232,12 +139,66 @@ def collect_blocking_obstacles(boxes, names_dict, frame_hw, cfg: Config, grid_sh
     return out
 
 
-def path_side_name(col: int, center_c: int, deadband_cells: int = 2):
-    if col < center_c - deadband_cells:
-        return "LEFT"
-    if col > center_c + deadband_cells:
-        return "RIGHT"
-    return "CENTER"
+def choose_dynamic_goal_cols(grid: np.ndarray, scan_r: int, center_c: int, cfg: Config):
+    row_free = (grid[scan_r] == 0)
+    segs = segments_from_row_free(row_free)
+    segs = [(c1, c2) for (c1, c2) in segs if (c2 - c1 + 1) >= cfg.branch_min_width_cells]
+    if not segs:
+        return [center_c]
+
+    cols = []
+    for c1, c2 in segs:
+        width = c2 - c1 + 1
+        if c1 <= center_c <= c2 and width >= cfg.branch_multi_path_min_width_cells:
+            left_c = int(round(c1 + width * cfg.branch_side_sample_ratio))
+            mid_c = int(round((c1 + c2) * 0.5))
+            right_c = int(round(c2 - width * cfg.branch_side_sample_ratio))
+            cols.extend([left_c, mid_c, right_c])
+        else:
+            cols.append(int(round((c1 + c2) * 0.5)))
+
+    # add centers of other wide segments too
+    for c1, c2 in segs:
+        c = int(round((c1 + c2) * 0.5))
+        cols.append(c)
+
+    out = []
+    for c in cols:
+        c = int(np.clip(c, 0, grid.shape[1] - 1))
+        if c not in out:
+            out.append(c)
+
+    out.sort(key=lambda c: abs(c - center_c))
+    return out[: cfg.max_branches] or [center_c]
+
+
+def choose_preferred_side(focus_vehicle, avoid_side, frame_w: int, center_c: int, grid_w: int, cfg: Config):
+    if focus_vehicle is None:
+        return avoid_side
+
+    focus_grid_c = int(
+        np.clip(round((focus_vehicle["center_x"] / max(1, frame_w - 1)) * (grid_w - 1)), 0, grid_w - 1)
+    )
+
+    # If the obstacle is left of center, go right. If right of center, go left.
+    if focus_grid_c < center_c - cfg.branch_label_deadband_cells:
+        return "right"
+    if focus_grid_c > center_c + cfg.branch_label_deadband_cells:
+        return "left"
+
+    return avoid_side
+
+
+def reorder_goal_cols(goal_cols, center_c: int, preferred_side: str | None, deadband_cells: int):
+    left_cols = [c for c in goal_cols if c < center_c - deadband_cells]
+    center_cols = [c for c in goal_cols if abs(c - center_c) <= deadband_cells]
+    right_cols = [c for c in goal_cols if c > center_c + deadband_cells]
+
+    if preferred_side == "left" and left_cols:
+        return left_cols + center_cols + right_cols
+    if preferred_side == "right" and right_cols:
+        return right_cols + center_cols + left_cols
+    return goal_cols
 
 
 def make_even(value: int) -> int:
@@ -249,18 +210,11 @@ def create_video_writer(save_path: str, fps: float, size: tuple[int, int]):
     ext = ext.lower()
 
     if ext == ".avi":
-        candidates = [
-            ("XVID", save_path),
-            ("MJPG", save_path),
-        ]
+        candidates = [("XVID", save_path), ("MJPG", save_path)]
     else:
         mp4_path = save_path if ext == ".mp4" else root + ".mp4"
         avi_path = root + ".avi"
-        candidates = [
-            ("mp4v", mp4_path),
-            ("XVID", avi_path),
-            ("MJPG", avi_path),
-        ]
+        candidates = [("mp4v", mp4_path), ("XVID", avi_path), ("MJPG", avi_path)]
 
     for codec, out_path in candidates:
         writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*codec), fps, size)
@@ -289,31 +243,23 @@ def main():
     cfg = Config()
     st = PlannerState()
 
-    out_fps_fallback = float(getattr(cfg, "out_fps_fallback", 25.0))
-    preview_max_width = int(getattr(cfg, "preview_max_width", 1280))
-    preview_max_height = int(getattr(cfg, "preview_max_height", 720))
-
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", default=str(cfg.video_source), help="video path or webcam index (0,1,...)")
     ap.add_argument("--save", default="output/result.mp4", help="output video path")
     ap.add_argument("--show", action="store_true", help="show preview window")
     args = ap.parse_args()
 
-    source = args.source
-    if isinstance(source, str) and source.isdigit():
-        source = int(source)
-
+    source = int(args.source) if isinstance(args.source, str) and args.source.isdigit() else args.source
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open source: {args.source}")
 
     fps_in = float(cap.get(cv2.CAP_PROP_FPS))
     if not np.isfinite(fps_in) or fps_in <= 1.0:
-        fps_in = out_fps_fallback
+        fps_in = cfg.out_fps_fallback
 
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
     w = max(2, make_even(src_w))
     h = max(2, make_even(src_h))
 
@@ -325,11 +271,9 @@ def main():
     print(f"[INFO] Output fps: {fps_in:.2f}")
     print(f"[INFO] Output codec: {codec_used}")
     print(f"[INFO] Saving to: {actual_save_path}")
-    if actual_save_path != args.save:
-        print(f"[INFO] Requested path {args.save} was replaced by {actual_save_path} for compatibility.")
 
     segmenter = RoadSegmenter(cfg.seg_model_id, max_side=cfg.seg_input_max_side)
-    detector = ObstacleDetector(cfg.yolo_model, cfg.yolo_conf, cfg.obstacle_names)
+    detector = ObstacleDetector(cfg.yolo_model, cfg.yolo_conf, cfg.obstacle_names, imgsz=cfg.yolo_imgsz)
 
     if args.show:
         cv2.namedWindow("Central Road Routing", cv2.WINDOW_NORMAL)
@@ -359,9 +303,7 @@ def main():
         )
 
         boxes = detector.detect(frame)
-        st.last_boxes = boxes
         obst_mask = detector.boxes_to_mask(boxes, (h, w))
-
         grid, cell = make_occupancy_grid(central_road, obst_mask, cfg.cell, cfg.inflate_cells)
         clearance = grid_distance_to_obstacles(grid)
 
@@ -372,8 +314,8 @@ def main():
         look_r = int(np.clip(cfg.lookahead_row_ratio * gh, 2, gh - 3))
 
         focus_vehicle = pick_focus_vehicle(boxes, detector.names, (h, w), cfg)
-        close_obstacles = collect_blocking_obstacles(boxes, detector.names, (h, w), cfg, (gh, gw))
-        near_obstacle = obstacle_present_in_roi(obst_mask, cfg) or bool(close_obstacles)
+        blocking_obstacles = collect_blocking_obstacles(boxes, detector.names, (h, w), cfg, (gh, gw))
+        near_obstacle = obstacle_present_in_roi(obst_mask, cfg) or bool(blocking_obstacles)
 
         lane_change_now = (
             focus_vehicle is not None
@@ -385,32 +327,31 @@ def main():
             st.lane_change_hold = max(0, st.lane_change_hold - 1)
         lane_change_active = st.lane_change_hold > 0
 
-        branch_scan_r = goal_r
+        if near_obstacle and st.avoid_side is None:
+            # Wider free area at lookahead row wins.
+            row_free = (grid[look_r] == 0)
+            free_cols = np.where(row_free)[0]
+            if free_cols.size > 0:
+                left_free = int(np.sum(free_cols < center_c))
+                right_free = int(np.sum(free_cols > center_c))
+                st.avoid_side = "left" if left_free >= right_free else "right"
+        elif (not near_obstacle) and cfg.keep_avoid_until_clear:
+            st.avoid_side = None
+
+        branch_scan_r = look_r
         if focus_vehicle is not None:
             lead_top_r = int(np.clip((focus_vehicle["top_y"] / max(1, h)) * gh, 0, gh - 1))
             branch_scan_r = int(np.clip(lead_top_r - cfg.lane_change_probe_up_cells, goal_r, gh - 3))
 
-        if cfg.keep_avoid_until_clear:
-            if near_obstacle and st.avoid_side is None:
-                st.avoid_side = pick_avoid_side(grid, look_r, center_c)
-            if (not near_obstacle) and st.avoid_side is not None:
-                st.avoid_side = None
-        else:
-            st.avoid_side = pick_avoid_side(grid, look_r, center_c) if near_obstacle else None
+        goal_cols = choose_dynamic_goal_cols(grid, branch_scan_r, center_c, cfg)
+        preferred_side = choose_preferred_side(focus_vehicle, st.avoid_side, w, center_c, gw, cfg)
+        goal_cols = reorder_goal_cols(goal_cols, center_c, preferred_side, cfg.branch_label_deadband_cells)
 
-        prefer = st.prev_goal_col if st.prev_goal_col is not None else center_c
-        branch_cols = choose_branches(grid, branch_scan_r, center_c, cfg, prefer_c=prefer)
+        best_path = []
+        best_goal_c = None
+        best_score = float("inf")
 
-        if st.avoid_side is not None and len(branch_cols) > 1:
-            if st.avoid_side == "left":
-                branch_cols.sort(key=lambda c: (c >= center_c, c))
-            else:
-                branch_cols.sort(key=lambda c: (c <= center_c, -c))
-
-        candidate_paths = []
-        best_path, best_score, best_goal_c = [], float("inf"), None
-
-        for gc in branch_cols:
+        for gc in goal_cols:
             goal = (goal_r, int(np.clip(gc, 0, gw - 1)))
             path, cost = astar_weighted(
                 grid,
@@ -424,21 +365,34 @@ def main():
             if not path:
                 continue
 
-            candidate_paths.append((gc, path, cost))
-            continuity_pen = 0.0 if st.prev_goal_col is None else cfg.goal_continuity_penalty * abs(gc - st.prev_goal_col)
+            path_clear = np.array([clearance[r, c] for (r, c) in path], dtype=np.float32)
+            mean_clear = float(path_clear.mean()) if path_clear.size else 0.0
+            low_clear_penalty = cfg.path_clearance_penalty / (mean_clear + 1.0)
+
+            continuity_pen = 0.0
+            if st.prev_goal_col is not None:
+                continuity_pen = cfg.goal_continuity_penalty * abs(gc - st.prev_goal_col)
+
             obstacle_pen = 0.0
-            for obs in close_obstacles:
+            for obs in blocking_obstacles:
                 margin = obs["half_w_cells"] + cfg.obstacle_goal_margin_cells
                 rel = abs(gc - obs["grid_c"]) / float(max(1, margin))
                 obstacle_pen += cfg.obstacle_goal_penalty * obs["strength"] * max(0.0, 1.0 - rel)
 
-            side_bias = 0.0
-            if lane_change_active and focus_vehicle is not None:
-                focus_grid_c = int(np.clip(round((focus_vehicle["center_x"] / max(1, w - 1)) * (gw - 1)), 0, gw - 1))
-                rel = abs(gc - focus_grid_c) / float(max(1, cfg.lane_change_block_half_width_cells))
-                side_bias += cfg.lane_change_vehicle_center_penalty * max(0.0, 1.0 - rel)
+            side_pen = 0.0
+            side_name = path_side_name(gc, center_c, cfg.branch_label_deadband_cells)
+            if lane_change_active and preferred_side == "left":
+                if side_name == "CENTER":
+                    side_pen += cfg.center_goal_penalty
+                elif side_name == "RIGHT":
+                    side_pen += cfg.wrong_side_penalty
+            elif lane_change_active and preferred_side == "right":
+                if side_name == "CENTER":
+                    side_pen += cfg.center_goal_penalty
+                elif side_name == "LEFT":
+                    side_pen += cfg.wrong_side_penalty
 
-            score = cost + continuity_pen + obstacle_pen + side_bias
+            score = cost + low_clear_penalty + continuity_pen + obstacle_pen + side_pen
             if score < best_score:
                 best_score = score
                 best_path = path
@@ -465,26 +419,6 @@ def main():
         vis = draw_boxes(vis, boxes, detector.names)
         vis = draw_focus_vehicle(vis, focus_vehicle if lane_change_active else None)
 
-        show_candidate_corridors = len(candidate_paths) > 1
-        if show_candidate_corridors:
-            for gc, path, _ in candidate_paths[:cfg.max_branches]:
-                if best_goal_c is not None and gc == best_goal_c:
-                    continue
-                pts = path_to_points_px(path, cell)
-                if pts and len(pts) >= 2:
-                    pts = resample_polyline(pts, n=cfg.candidate_resample_points)
-                    vis = draw_guidance_corridor(
-                        vis,
-                        pts,
-                        road_mask=central_road,
-                        fill_color=cfg.candidate_corridor_fill_color,
-                        edge_color=cfg.candidate_corridor_edge_color,
-                        edge_thickness=cfg.candidate_corridor_edge_thickness_px,
-                        half_w_bottom=cfg.candidate_corridor_start_half_width_px,
-                        half_w_top=cfg.candidate_corridor_end_half_width_px,
-                        fill_alpha=cfg.candidate_corridor_alpha,
-                    )
-
         pts_best = path_to_points_px(best_path, cell)
         if pts_best and len(pts_best) >= 2:
             pts_best = resample_polyline(pts_best, n=cfg.best_path_resample_points)
@@ -493,18 +427,34 @@ def main():
             vis = draw_guidance_corridor(
                 vis,
                 pts_best,
-                road_mask=central_road,
+                road_mask=None if not cfg.clip_best_corridor_to_road else central_road,
                 fill_color=cfg.best_corridor_fill_color,
                 edge_color=cfg.best_corridor_edge_color,
+                center_color=cfg.best_corridor_center_color,
                 edge_thickness=cfg.best_corridor_edge_thickness_px,
+                center_thickness=cfg.best_corridor_center_thickness_px,
                 half_w_bottom=cfg.corridor_start_half_width_px,
                 half_w_top=cfg.corridor_end_half_width_px,
                 fill_alpha=cfg.corridor_alpha,
             )
-        else:
-            st.prev_centerline = None
+            vis = draw_direction_arrow(vis, pts_best, color=cfg.best_path_text_color, thickness=cfg.arrow_thickness_px)
+        elif st.prev_centerline is not None and len(st.prev_centerline) >= 2:
+            vis = draw_guidance_corridor(
+                vis,
+                st.prev_centerline,
+                road_mask=None if not cfg.clip_best_corridor_to_road else central_road,
+                fill_color=cfg.best_corridor_fill_color,
+                edge_color=cfg.best_corridor_edge_color,
+                center_color=cfg.best_corridor_center_color,
+                edge_thickness=cfg.best_corridor_edge_thickness_px,
+                center_thickness=cfg.best_corridor_center_thickness_px,
+                half_w_bottom=cfg.corridor_start_half_width_px,
+                half_w_top=cfg.corridor_end_half_width_px,
+                fill_alpha=cfg.corridor_alpha,
+            )
+            vis = draw_direction_arrow(vis, st.prev_centerline, color=cfg.best_path_text_color, thickness=cfg.arrow_thickness_px)
 
-        mode = "AVOID: " + (st.avoid_side.upper() if st.avoid_side else "NONE")
+        mode = "AVOID: " + (preferred_side.upper() if preferred_side else "NONE")
         cv2.putText(vis, mode, (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
 
         if focus_vehicle is not None:
@@ -520,30 +470,12 @@ def main():
                 cv2.LINE_AA,
             )
 
-        if candidate_paths:
-            option_names = []
-            for gc, _, _ in candidate_paths[:cfg.max_branches]:
-                name = path_side_name(gc, center_c, deadband_cells=cfg.branch_label_deadband_cells)
-                if name not in option_names:
-                    option_names.append(name)
-            if option_names:
-                cv2.putText(
-                    vis,
-                    "OPTIONS: " + " | ".join(option_names),
-                    (15, 100),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.72,
-                    (0, 255, 255) if lane_change_active or near_obstacle else (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-
         if best_goal_c is not None:
             best_name = path_side_name(best_goal_c, center_c, deadband_cells=cfg.branch_label_deadband_cells)
             cv2.putText(
                 vis,
                 "BEST PATH: " + best_name,
-                (15, 132),
+                (15, 100),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.72,
                 cfg.best_path_text_color,
@@ -554,7 +486,7 @@ def main():
         writer.write(vis)
 
         if args.show:
-            preview = fit_frame_to_window(vis, preview_max_width, preview_max_height)
+            preview = fit_frame_to_window(vis, cfg.preview_max_width, cfg.preview_max_height)
             cv2.imshow("Central Road Routing", preview)
             if (cv2.waitKey(1) & 0xFF) in (27, ord("q")):
                 args.show = False
