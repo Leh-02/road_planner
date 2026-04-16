@@ -1,3 +1,4 @@
+
 from dataclasses import dataclass
 
 
@@ -24,6 +25,39 @@ class Config:
     center_band_ratio: float = 0.25
     seed_y_ratio: float = 0.92
     seed_x_span_ratio: float = 0.06
+
+    # --- BEV / IPM ---
+    use_bev: bool = True
+    bev_width: int = 640
+    bev_height: int = 800
+
+    # 4 source points on the input frame.
+    # You should tune these points for your camera/video.
+    # If a point is in [0..1], it is interpreted as a relative coordinate.
+    bev_src_points: tuple[tuple[float, float], ...] = (
+        (0.43, 0.62),
+        (0.57, 0.62),
+        (0.98, 0.98),
+        (0.02, 0.98),
+    )
+
+    # 4 destination points inside the BEV image.
+    bev_dst_points: tuple[tuple[float, float], ...] = (
+        (0.28, 0.00),
+        (0.72, 0.00),
+        (0.72, 0.99),
+        (0.28, 0.99),
+    )
+
+    # Metric scale of BEV.
+    meters_per_pixel_x: float = 0.03
+    meters_per_pixel_y: float = 0.03
+
+    # --- Temporal fusion ---
+    road_ema_alpha: float = 0.80
+    obstacle_ema_alpha: float = 0.70
+    road_prob_threshold: float = 0.45
+    obstacle_prob_threshold: float = 0.35
 
     # --- Grid / planning ---
     cell: int = 8
@@ -60,6 +94,14 @@ class Config:
     center_goal_penalty: float = 16.0
     wrong_side_penalty: float = 42.0
 
+    # --- Centerline fitting ---
+    use_polyfit_centerline: bool = True
+    polyfit_degree: int = 2
+    polyfit_min_points: int = 8
+
+    # --- Metric corridor in BEV ---
+    corridor_half_width_m: float = 1.5
+
     # --- Visualization ---
     road_mask_color: tuple[int, int, int] = (0, 255, 0)
     road_mask_alpha: float = 0.16
@@ -69,8 +111,10 @@ class Config:
     best_path_resample_points: int = 32
     centerline_smooth_alpha: float = 0.35
 
+    # Fallback corridor width in image space when BEV is disabled
     corridor_start_half_width_px: int = 88
     corridor_end_half_width_px: int = 18
+
     corridor_alpha: float = 0.34
     best_corridor_fill_color: tuple[int, int, int] = (255, 140, 0)
     best_corridor_edge_color: tuple[int, int, int] = (255, 255, 255)

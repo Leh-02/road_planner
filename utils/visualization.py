@@ -1,3 +1,4 @@
+
 import cv2
 import numpy as np
 
@@ -114,6 +115,17 @@ def _clip_layer_to_mask(layer, road_mask):
     return clipped
 
 
+def _clip_points_to_frame(pts_xy, H, W):
+    if pts_xy is None:
+        return None
+    out = []
+    for x, y in pts_xy:
+        xi = int(np.clip(round(x), 0, W - 1))
+        yi = int(np.clip(round(y), 0, H - 1))
+        out.append((xi, yi))
+    return out
+
+
 def draw_guidance_corridor(
     frame_bgr,
     pts_xy,
@@ -142,6 +154,59 @@ def draw_guidance_corridor(
     cv2.polylines(edge_layer, [np.array(left, dtype=np.int32).reshape(-1, 1, 2)], False, edge_color, edge_thickness, cv2.LINE_AA)
     cv2.polylines(edge_layer, [np.array(right, dtype=np.int32).reshape(-1, 1, 2)], False, edge_color, edge_thickness, cv2.LINE_AA)
     cv2.polylines(center_layer, [np.array(pts_xy, dtype=np.int32).reshape(-1, 1, 2)], False, center_color, center_thickness, cv2.LINE_AA)
+
+    fill_layer = _clip_layer_to_mask(fill_layer, road_mask)
+    edge_layer = _clip_layer_to_mask(edge_layer, road_mask)
+    center_layer = _clip_layer_to_mask(center_layer, road_mask)
+
+    fill_nz = np.any(fill_layer > 0, axis=2)
+    if np.any(fill_nz):
+        out[fill_nz] = cv2.addWeighted(out[fill_nz], 1.0 - fill_alpha, fill_layer[fill_nz], fill_alpha, 0)
+
+    edge_nz = np.any(edge_layer > 0, axis=2)
+    if np.any(edge_nz):
+        out[edge_nz] = edge_layer[edge_nz]
+
+    center_nz = np.any(center_layer > 0, axis=2)
+    if np.any(center_nz):
+        out[center_nz] = center_layer[center_nz]
+
+    return out
+
+
+def draw_projected_corridor(
+    frame_bgr,
+    center_pts_xy,
+    left_pts_xy,
+    right_pts_xy,
+    road_mask=None,
+    fill_color=(255, 140, 0),
+    edge_color=(255, 255, 255),
+    center_color=(0, 255, 255),
+    edge_thickness=3,
+    center_thickness=4,
+    fill_alpha=0.34,
+):
+    out = frame_bgr.copy()
+    if center_pts_xy is None or left_pts_xy is None or right_pts_xy is None:
+        return out
+    if len(center_pts_xy) < 2 or len(left_pts_xy) < 2 or len(right_pts_xy) < 2:
+        return out
+
+    H, W = out.shape[:2]
+    center_pts_xy = _clip_points_to_frame(center_pts_xy, H, W)
+    left_pts_xy = _clip_points_to_frame(left_pts_xy, H, W)
+    right_pts_xy = _clip_points_to_frame(right_pts_xy, H, W)
+
+    poly = np.array(left_pts_xy + right_pts_xy[::-1], dtype=np.int32).reshape(-1, 1, 2)
+    fill_layer = np.zeros_like(out, dtype=np.uint8)
+    edge_layer = np.zeros_like(out, dtype=np.uint8)
+    center_layer = np.zeros_like(out, dtype=np.uint8)
+
+    cv2.fillPoly(fill_layer, [poly], fill_color, lineType=cv2.LINE_AA)
+    cv2.polylines(edge_layer, [np.array(left_pts_xy, dtype=np.int32).reshape(-1, 1, 2)], False, edge_color, edge_thickness, cv2.LINE_AA)
+    cv2.polylines(edge_layer, [np.array(right_pts_xy, dtype=np.int32).reshape(-1, 1, 2)], False, edge_color, edge_thickness, cv2.LINE_AA)
+    cv2.polylines(center_layer, [np.array(center_pts_xy, dtype=np.int32).reshape(-1, 1, 2)], False, center_color, center_thickness, cv2.LINE_AA)
 
     fill_layer = _clip_layer_to_mask(fill_layer, road_mask)
     edge_layer = _clip_layer_to_mask(edge_layer, road_mask)

@@ -1,3 +1,4 @@
+
 import argparse
 import os
 
@@ -7,9 +8,12 @@ import numpy as np
 from config import Config
 from segmentation.model import RoadSegmenter
 from detection.yolo import ObstacleDetector
+from mapping.bev import BEVProjector
 from mapping.road_selection import select_central_road
 from mapping.grid_builder import make_occupancy_grid, grid_distance_to_obstacles
+from mapping.temporal import ema_prob, prob_to_mask
 from planning.astar_weighted import astar_weighted
+from planning.centerline import fit_poly_centerline, build_metric_corridor_edges
 from utils.visualization import (
     overlay_mask,
     draw_boxes,
@@ -17,6 +21,7 @@ from utils.visualization import (
     resample_polyline,
     smooth_polyline,
     draw_guidance_corridor,
+    draw_projected_corridor,
     draw_focus_vehicle,
     draw_direction_arrow,
 )
@@ -109,7 +114,7 @@ def pick_focus_vehicle(boxes, names_dict, frame_hw, cfg: Config):
     }
 
 
-def collect_blocking_obstacles(boxes, names_dict, frame_hw, cfg: Config, grid_shape):
+def collect_blocking_obstacles(boxes, names_dict, frame_hw, cfg: Config, grid_shape, bev: BEVProjector | None = None, cell: int = 1):
     h, w = frame_hw
     gh, gw = grid_shape
     valid_names = {str(n).lower() for n in cfg.lane_change_vehicle_names} | {"person"}
@@ -125,22 +130,46 @@ def collect_blocking_obstacles(boxes, names_dict, frame_hw, cfg: Config, grid_sh
         if bottom_gap_px > cfg.blocking_obstacle_bottom_px:
             continue
 
-        cx = int(round((x1 + x2) * 0.5))
         width_px = max(1, x2 - x1)
-        grid_c = int(np.clip(round((cx / max(1, w - 1)) * (gw - 1)), 0, gw - 1))
-        half_w_cells = max(1, int(round((width_px / max(1, w)) * gw * 0.5)))
         strength = 1.0 - float(bottom_gap_px) / float(max(1, cfg.blocking_obstacle_bottom_px))
-        out.append({
-            "grid_c": grid_c,
-            "half_w_cells": half_w_cells,
-            "strength": float(np.clip(strength, 0.15, 1.0)),
-        })
+        strength = float(np.clip(strength, 0.15, 1.0))
+
+        if bev is None:
+            cx = int(round((x1 + x2) * 0.5))
+            grid_c = int(np.clip(round((cx / max(1, w - 1)) * (gw - 1)), 0, gw - 1))
+            half_w_cells = max(1, int(round((width_px / max(1, w)) * gw * 0.5)))
+        else:
+            bev_pts = bev.image_to_bev_points(
+                [
+                    (x1, y2),
+                    (x2, y2),
+                    (0.5 * (x1 + x2), y2),
+                ]
+            )
+            if len(bev_pts) != 3:
+                continue
+
+            bx1 = bev_pts[0][0]
+            bx2 = bev_pts[1][0]
+            bxc = bev_pts[2][0]
+
+            grid_c = int(np.clip(round(float(bxc) / max(1, cell)), 0, gw - 1))
+            width_bev_px = abs(float(bx2) - float(bx1))
+            half_w_cells = max(1, int(round((width_bev_px / max(1, cell)) * 0.5)))
+
+        out.append(
+            {
+                "grid_c": int(grid_c),
+                "half_w_cells": int(half_w_cells),
+                "strength": strength,
+            }
+        )
 
     return out
 
 
 def choose_dynamic_goal_cols(grid: np.ndarray, scan_r: int, center_c: int, cfg: Config):
-    row_free = (grid[scan_r] == 0)
+    row_free = grid[scan_r] == 0
     segs = segments_from_row_free(row_free)
     segs = [(c1, c2) for (c1, c2) in segs if (c2 - c1 + 1) >= cfg.branch_min_width_cells]
     if not segs:
@@ -157,7 +186,6 @@ def choose_dynamic_goal_cols(grid: np.ndarray, scan_r: int, center_c: int, cfg: 
         else:
             cols.append(int(round((c1 + c2) * 0.5)))
 
-    # add centers of other wide segments too
     for c1, c2 in segs:
         c = int(round((c1 + c2) * 0.5))
         cols.append(c)
@@ -172,15 +200,30 @@ def choose_dynamic_goal_cols(grid: np.ndarray, scan_r: int, center_c: int, cfg: 
     return out[: cfg.max_branches] or [center_c]
 
 
-def choose_preferred_side(focus_vehicle, avoid_side, frame_w: int, center_c: int, grid_w: int, cfg: Config):
+def choose_preferred_side(
+    focus_vehicle,
+    avoid_side,
+    frame_hw,
+    center_c: int,
+    grid_w: int,
+    cfg: Config,
+    bev: BEVProjector | None = None,
+    cell: int = 1,
+):
     if focus_vehicle is None:
         return avoid_side
 
-    focus_grid_c = int(
-        np.clip(round((focus_vehicle["center_x"] / max(1, frame_w - 1)) * (grid_w - 1)), 0, grid_w - 1)
-    )
+    frame_h, frame_w = frame_hw
+    if bev is None:
+        focus_grid_c = int(
+            np.clip(round((focus_vehicle["center_x"] / max(1, frame_w - 1)) * (grid_w - 1)), 0, grid_w - 1)
+        )
+    else:
+        bev_pts = bev.image_to_bev_points([(focus_vehicle["center_x"], focus_vehicle["bottom_y"])])
+        if not bev_pts:
+            return avoid_side
+        focus_grid_c = int(np.clip(round(float(bev_pts[0][0]) / max(1, cell)), 0, grid_w - 1))
 
-    # If the obstacle is left of center, go right. If right of center, go left.
     if focus_grid_c < center_c - cfg.branch_label_deadband_cells:
         return "right"
     if focus_grid_c > center_c + cfg.branch_label_deadband_cells:
@@ -239,6 +282,41 @@ def fit_frame_to_window(frame_bgr, max_w, max_h):
     return cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
+def corridor_from_previous_bev(vis, central_road, st: PlannerState, bev: BEVProjector, cfg: Config):
+    if st.prev_centerline_bev is None or len(st.prev_centerline_bev) < 2:
+        return vis
+
+    left_bev, right_bev = build_metric_corridor_edges(
+        st.prev_centerline_bev,
+        half_width_m=cfg.corridor_half_width_m,
+        meters_per_pixel_x=cfg.meters_per_pixel_x,
+        meters_per_pixel_y=cfg.meters_per_pixel_y,
+        out_hw=(cfg.bev_height, cfg.bev_width),
+    )
+    if left_bev is None or right_bev is None:
+        return vis
+
+    center_img = bev.bev_to_image_points(st.prev_centerline_bev)
+    left_img = bev.bev_to_image_points(left_bev)
+    right_img = bev.bev_to_image_points(right_bev)
+
+    vis = draw_projected_corridor(
+        vis,
+        center_img,
+        left_img,
+        right_img,
+        road_mask=central_road if cfg.clip_best_corridor_to_road else None,
+        fill_color=cfg.best_corridor_fill_color,
+        edge_color=cfg.best_corridor_edge_color,
+        center_color=cfg.best_corridor_center_color,
+        edge_thickness=cfg.best_corridor_edge_thickness_px,
+        center_thickness=cfg.best_corridor_center_thickness_px,
+        fill_alpha=cfg.corridor_alpha,
+    )
+    vis = draw_direction_arrow(vis, center_img, color=cfg.best_path_text_color, thickness=cfg.arrow_thickness_px)
+    return vis
+
+
 def main():
     cfg = Config()
     st = PlannerState()
@@ -274,6 +352,7 @@ def main():
 
     segmenter = RoadSegmenter(cfg.seg_model_id, max_side=cfg.seg_input_max_side)
     detector = ObstacleDetector(cfg.yolo_model, cfg.yolo_conf, cfg.obstacle_names, imgsz=cfg.yolo_imgsz)
+    bev = BEVProjector.from_config((h, w), cfg) if cfg.use_bev else None
 
     if args.show:
         cv2.namedWindow("Central Road Routing", cv2.WINDOW_NORMAL)
@@ -304,7 +383,17 @@ def main():
 
         boxes = detector.detect(frame)
         obst_mask = detector.boxes_to_mask(boxes, (h, w))
-        grid, cell = make_occupancy_grid(central_road, obst_mask, cfg.cell, cfg.inflate_cells)
+
+        plan_road = bev.warp_mask(central_road) if bev is not None else central_road
+        plan_obst = bev.warp_mask(obst_mask) if bev is not None else obst_mask
+
+        st.prev_road_prob = ema_prob(st.prev_road_prob, plan_road, alpha=cfg.road_ema_alpha)
+        st.prev_obst_prob = ema_prob(st.prev_obst_prob, plan_obst, alpha=cfg.obstacle_ema_alpha)
+
+        road_plan_s = prob_to_mask(st.prev_road_prob, thr=cfg.road_prob_threshold)
+        obst_plan_s = prob_to_mask(st.prev_obst_prob, thr=cfg.obstacle_prob_threshold)
+
+        grid, cell = make_occupancy_grid(road_plan_s, obst_plan_s, cfg.cell, cfg.inflate_cells)
         clearance = grid_distance_to_obstacles(grid)
 
         gh, gw = grid.shape
@@ -314,7 +403,15 @@ def main():
         look_r = int(np.clip(cfg.lookahead_row_ratio * gh, 2, gh - 3))
 
         focus_vehicle = pick_focus_vehicle(boxes, detector.names, (h, w), cfg)
-        blocking_obstacles = collect_blocking_obstacles(boxes, detector.names, (h, w), cfg, (gh, gw))
+        blocking_obstacles = collect_blocking_obstacles(
+            boxes,
+            detector.names,
+            (h, w),
+            cfg,
+            (gh, gw),
+            bev=bev,
+            cell=cell,
+        )
         near_obstacle = obstacle_present_in_roi(obst_mask, cfg) or bool(blocking_obstacles)
 
         lane_change_now = (
@@ -328,8 +425,7 @@ def main():
         lane_change_active = st.lane_change_hold > 0
 
         if near_obstacle and st.avoid_side is None:
-            # Wider free area at lookahead row wins.
-            row_free = (grid[look_r] == 0)
+            row_free = grid[look_r] == 0
             free_cols = np.where(row_free)[0]
             if free_cols.size > 0:
                 left_free = int(np.sum(free_cols < center_c))
@@ -340,11 +436,27 @@ def main():
 
         branch_scan_r = look_r
         if focus_vehicle is not None:
-            lead_top_r = int(np.clip((focus_vehicle["top_y"] / max(1, h)) * gh, 0, gh - 1))
+            if bev is None:
+                lead_top_r = int(np.clip((focus_vehicle["top_y"] / max(1, h)) * gh, 0, gh - 1))
+            else:
+                proj = bev.image_to_bev_points([(focus_vehicle["center_x"], focus_vehicle["top_y"])])
+                if proj:
+                    lead_top_r = int(np.clip(float(proj[0][1]) / max(1, cell), 0, gh - 1))
+                else:
+                    lead_top_r = int(np.clip((focus_vehicle["top_y"] / max(1, h)) * gh, 0, gh - 1))
             branch_scan_r = int(np.clip(lead_top_r - cfg.lane_change_probe_up_cells, goal_r, gh - 3))
 
         goal_cols = choose_dynamic_goal_cols(grid, branch_scan_r, center_c, cfg)
-        preferred_side = choose_preferred_side(focus_vehicle, st.avoid_side, w, center_c, gw, cfg)
+        preferred_side = choose_preferred_side(
+            focus_vehicle,
+            st.avoid_side,
+            (h, w),
+            center_c,
+            gw,
+            cfg,
+            bev=bev,
+            cell=cell,
+        )
         goal_cols = reorder_goal_cols(goal_cols, center_c, preferred_side, cfg.branch_label_deadband_cells)
 
         best_path = []
@@ -420,39 +532,86 @@ def main():
         vis = draw_focus_vehicle(vis, focus_vehicle if lane_change_active else None)
 
         pts_best = path_to_points_px(best_path, cell)
+
         if pts_best and len(pts_best) >= 2:
             pts_best = resample_polyline(pts_best, n=cfg.best_path_resample_points)
-            pts_best = smooth_polyline(st.prev_centerline, pts_best, alpha=cfg.centerline_smooth_alpha)
-            st.prev_centerline = pts_best
-            vis = draw_guidance_corridor(
-                vis,
-                pts_best,
-                road_mask=None if not cfg.clip_best_corridor_to_road else central_road,
-                fill_color=cfg.best_corridor_fill_color,
-                edge_color=cfg.best_corridor_edge_color,
-                center_color=cfg.best_corridor_center_color,
-                edge_thickness=cfg.best_corridor_edge_thickness_px,
-                center_thickness=cfg.best_corridor_center_thickness_px,
-                half_w_bottom=cfg.corridor_start_half_width_px,
-                half_w_top=cfg.corridor_end_half_width_px,
-                fill_alpha=cfg.corridor_alpha,
-            )
-            vis = draw_direction_arrow(vis, pts_best, color=cfg.best_path_text_color, thickness=cfg.arrow_thickness_px)
-        elif st.prev_centerline is not None and len(st.prev_centerline) >= 2:
-            vis = draw_guidance_corridor(
-                vis,
-                st.prev_centerline,
-                road_mask=None if not cfg.clip_best_corridor_to_road else central_road,
-                fill_color=cfg.best_corridor_fill_color,
-                edge_color=cfg.best_corridor_edge_color,
-                center_color=cfg.best_corridor_center_color,
-                edge_thickness=cfg.best_corridor_edge_thickness_px,
-                center_thickness=cfg.best_corridor_center_thickness_px,
-                half_w_bottom=cfg.corridor_start_half_width_px,
-                half_w_top=cfg.corridor_end_half_width_px,
-                fill_alpha=cfg.corridor_alpha,
-            )
-            vis = draw_direction_arrow(vis, st.prev_centerline, color=cfg.best_path_text_color, thickness=cfg.arrow_thickness_px)
+
+            if cfg.use_polyfit_centerline and len(pts_best) >= cfg.polyfit_min_points:
+                out_hw = (cfg.bev_height, cfg.bev_width) if bev is not None else (h, w)
+                pts_best = fit_poly_centerline(
+                    pts_best,
+                    degree=cfg.polyfit_degree,
+                    samples=cfg.best_path_resample_points,
+                    out_hw=out_hw,
+                )
+
+            if bev is not None:
+                pts_best = smooth_polyline(st.prev_centerline_bev, pts_best, alpha=cfg.centerline_smooth_alpha)
+                st.prev_centerline_bev = pts_best
+
+                left_bev, right_bev = build_metric_corridor_edges(
+                    pts_best,
+                    half_width_m=cfg.corridor_half_width_m,
+                    meters_per_pixel_x=cfg.meters_per_pixel_x,
+                    meters_per_pixel_y=cfg.meters_per_pixel_y,
+                    out_hw=(cfg.bev_height, cfg.bev_width),
+                )
+
+                if left_bev is not None and right_bev is not None:
+                    center_img = bev.bev_to_image_points(pts_best)
+                    left_img = bev.bev_to_image_points(left_bev)
+                    right_img = bev.bev_to_image_points(right_bev)
+
+                    vis = draw_projected_corridor(
+                        vis,
+                        center_img,
+                        left_img,
+                        right_img,
+                        road_mask=central_road if cfg.clip_best_corridor_to_road else None,
+                        fill_color=cfg.best_corridor_fill_color,
+                        edge_color=cfg.best_corridor_edge_color,
+                        center_color=cfg.best_corridor_center_color,
+                        edge_thickness=cfg.best_corridor_edge_thickness_px,
+                        center_thickness=cfg.best_corridor_center_thickness_px,
+                        fill_alpha=cfg.corridor_alpha,
+                    )
+                    vis = draw_direction_arrow(vis, center_img, color=cfg.best_path_text_color, thickness=cfg.arrow_thickness_px)
+            else:
+                pts_best = smooth_polyline(st.prev_centerline_img, pts_best, alpha=cfg.centerline_smooth_alpha)
+                st.prev_centerline_img = pts_best
+
+                vis = draw_guidance_corridor(
+                    vis,
+                    pts_best,
+                    road_mask=None if not cfg.clip_best_corridor_to_road else central_road,
+                    fill_color=cfg.best_corridor_fill_color,
+                    edge_color=cfg.best_corridor_edge_color,
+                    center_color=cfg.best_corridor_center_color,
+                    edge_thickness=cfg.best_corridor_edge_thickness_px,
+                    center_thickness=cfg.best_corridor_center_thickness_px,
+                    half_w_bottom=cfg.corridor_start_half_width_px,
+                    half_w_top=cfg.corridor_end_half_width_px,
+                    fill_alpha=cfg.corridor_alpha,
+                )
+                vis = draw_direction_arrow(vis, pts_best, color=cfg.best_path_text_color, thickness=cfg.arrow_thickness_px)
+        else:
+            if bev is not None:
+                vis = corridor_from_previous_bev(vis, central_road, st, bev, cfg)
+            elif st.prev_centerline_img is not None and len(st.prev_centerline_img) >= 2:
+                vis = draw_guidance_corridor(
+                    vis,
+                    st.prev_centerline_img,
+                    road_mask=None if not cfg.clip_best_corridor_to_road else central_road,
+                    fill_color=cfg.best_corridor_fill_color,
+                    edge_color=cfg.best_corridor_edge_color,
+                    center_color=cfg.best_corridor_center_color,
+                    edge_thickness=cfg.best_corridor_edge_thickness_px,
+                    center_thickness=cfg.best_corridor_center_thickness_px,
+                    half_w_bottom=cfg.corridor_start_half_width_px,
+                    half_w_top=cfg.corridor_end_half_width_px,
+                    fill_alpha=cfg.corridor_alpha,
+                )
+                vis = draw_direction_arrow(vis, st.prev_centerline_img, color=cfg.best_path_text_color, thickness=cfg.arrow_thickness_px)
 
         mode = "AVOID: " + (preferred_side.upper() if preferred_side else "NONE")
         cv2.putText(vis, mode, (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
