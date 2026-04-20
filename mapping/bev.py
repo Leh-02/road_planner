@@ -1,4 +1,3 @@
-
 import cv2
 import numpy as np
 
@@ -18,7 +17,7 @@ def _resolve_points(points, width: int, height: int) -> np.ndarray:
 
 class BEVProjector:
     def __init__(self, src_points, dst_points, out_size: tuple[int, int]):
-        self.out_size = (int(out_size[0]), int(out_size[1]))  # (width, height)
+        self.out_size = (int(out_size[0]), int(out_size[1]))
         self.src_points = np.asarray(src_points, dtype=np.float32)
         self.dst_points = np.asarray(dst_points, dtype=np.float32)
         self.H = cv2.getPerspectiveTransform(self.src_points, self.dst_points)
@@ -29,26 +28,15 @@ class BEVProjector:
         frame_h, frame_w = frame_hw
         bev_w = int(cfg.bev_width)
         bev_h = int(cfg.bev_height)
-
         src_points = _resolve_points(cfg.bev_src_points, frame_w, frame_h)
         dst_points = _resolve_points(cfg.bev_dst_points, bev_w, bev_h)
         return cls(src_points, dst_points, (bev_w, bev_h))
 
     def warp_mask(self, mask_u8: np.ndarray) -> np.ndarray:
-        return cv2.warpPerspective(
-            mask_u8,
-            self.H,
-            self.out_size,
-            flags=cv2.INTER_NEAREST,
-        )
+        return cv2.warpPerspective(mask_u8, self.H, self.out_size, flags=cv2.INTER_NEAREST)
 
     def warp_image(self, frame_bgr: np.ndarray) -> np.ndarray:
-        return cv2.warpPerspective(
-            frame_bgr,
-            self.H,
-            self.out_size,
-            flags=cv2.INTER_LINEAR,
-        )
+        return cv2.warpPerspective(frame_bgr, self.H, self.out_size, flags=cv2.INTER_LINEAR)
 
     def image_to_bev_points(self, pts_xy):
         if pts_xy is None or len(pts_xy) == 0:

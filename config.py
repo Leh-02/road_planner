@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 
 
@@ -31,17 +30,13 @@ class Config:
     bev_width: int = 640
     bev_height: int = 800
 
-    # 4 source points on the input frame.
-    # You should tune these points for your camera/video.
-    # If a point is in [0..1], it is interpreted as a relative coordinate.
+    # Tune these for each camera profile if needed.
     bev_src_points: tuple[tuple[float, float], ...] = (
         (0.43, 0.62),
         (0.57, 0.62),
         (0.98, 0.98),
         (0.02, 0.98),
     )
-
-    # 4 destination points inside the BEV image.
     bev_dst_points: tuple[tuple[float, float], ...] = (
         (0.28, 0.00),
         (0.72, 0.00),
@@ -49,7 +44,6 @@ class Config:
         (0.28, 0.99),
     )
 
-    # Metric scale of BEV.
     meters_per_pixel_x: float = 0.03
     meters_per_pixel_y: float = 0.03
 
@@ -58,6 +52,25 @@ class Config:
     obstacle_ema_alpha: float = 0.70
     road_prob_threshold: float = 0.45
     obstacle_prob_threshold: float = 0.35
+
+    # --- Lane detection / lane prior ---
+    use_lane_detection: bool = True
+    lane_min_confidence: float = 0.22
+    lane_hold_frames: int = 12
+    lane_samples: int = 24
+    lane_top_y_ratio: float = 0.18
+    lane_width_m: float = 3.5
+    lane_search_margin_m: float = 2.4
+    lane_marking_morph_kernel: int = 5
+    lane_marking_debug_alpha: float = 0.10
+    lane_center_penalty_weight: float = 0.010
+    lane_center_blend_weight: float = 0.38
+    lane_boundary_trust_threshold: float = 0.40
+
+    # --- Obstacle relevance filtering ---
+    use_lane_relevance_filter: bool = True
+    obstacle_lane_margin_m: float = 0.80
+    obstacle_must_touch_road: bool = True
 
     # --- Grid / planning ---
     cell: int = 8
@@ -94,13 +107,16 @@ class Config:
     center_goal_penalty: float = 16.0
     wrong_side_penalty: float = 42.0
 
+    # --- Corridor quality / persistence ---
+    min_path_points: int = 8
+    corridor_hold_frames: int = 14
+    max_polyline_shift_px: float = 55.0
+    max_curve_dx_per_step_px: float = 26.0
+
     # --- Centerline fitting ---
     use_polyfit_centerline: bool = True
     polyfit_degree: int = 2
-    polyfit_min_points: int = 8
-
-    # --- Metric corridor in BEV ---
-    corridor_half_width_m: float = 1.5
+    polyfit_min_points: int = 6
 
     # --- Visualization ---
     road_mask_color: tuple[int, int, int] = (0, 255, 0)
@@ -110,11 +126,10 @@ class Config:
 
     best_path_resample_points: int = 32
     centerline_smooth_alpha: float = 0.35
+    corridor_half_width_m: float = 1.5
 
-    # Fallback corridor width in image space when BEV is disabled
     corridor_start_half_width_px: int = 88
     corridor_end_half_width_px: int = 18
-
     corridor_alpha: float = 0.34
     best_corridor_fill_color: tuple[int, int, int] = (255, 140, 0)
     best_corridor_edge_color: tuple[int, int, int] = (255, 255, 255)
@@ -124,5 +139,9 @@ class Config:
     best_corridor_center_thickness_px: int = 4
     arrow_thickness_px: int = 5
 
-    # corridor visibility
+    draw_lane_guides: bool = True
+    lane_left_color: tuple[int, int, int] = (255, 255, 255)
+    lane_right_color: tuple[int, int, int] = (255, 255, 255)
+    lane_center_color: tuple[int, int, int] = (0, 220, 255)
+
     clip_best_corridor_to_road: bool = False
