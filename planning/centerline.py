@@ -1,11 +1,32 @@
 import numpy as np
 
 
-def fit_poly_centerline(pts_xy, degree: int = 2, samples: int = 32, out_hw: tuple[int, int] | None = None):
-    if pts_xy is None or len(pts_xy) < 2:
+def _as_points_array(pts_xy):
+    if pts_xy is None:
+        return None
+    pts = np.asarray(pts_xy, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 2:
+        return None
+    return pts
+
+
+def _moving_average_1d(arr: np.ndarray, window: int) -> np.ndarray:
+    window = int(max(1, window))
+    if window <= 1 or arr.size < 3:
+        return arr.copy()
+    if window % 2 == 0:
+        window += 1
+    pad = window // 2
+    padded = np.pad(arr.astype(np.float32), (pad, pad), mode="edge")
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    return np.convolve(padded, kernel, mode="valid").astype(np.float32)
+
+
+def fit_poly_centerline(pts_xy, degree: int = 2, samples: int = 32, out_hw: tuple[int, int] | None = None, smooth_window: int = 5):
+    pts = _as_points_array(pts_xy)
+    if pts is None:
         return pts_xy
 
-    pts = np.asarray(pts_xy, dtype=np.float32)
     ys = pts[:, 1]
     xs = pts[:, 0]
 
@@ -27,17 +48,19 @@ def fit_poly_centerline(pts_xy, degree: int = 2, samples: int = 32, out_hw: tupl
     if uniq_y.size < 3:
         return [(int(round(x)), int(round(y))) for x, y in pts_xy]
 
+    # Prefer nearer points a bit more because they are usually more reliable.
+    y_norm = (uniq_y - float(np.min(uniq_y))) / max(1.0, float(np.max(uniq_y) - np.min(uniq_y)))
+    weights = 0.65 + 0.55 * y_norm
     deg = int(max(1, min(int(degree), uniq_y.size - 1)))
     try:
-        coef = np.polyfit(uniq_y, uniq_x, deg=deg)
+        coef = np.polyfit(uniq_y, uniq_x, deg=deg, w=weights)
+        sample_ys = np.linspace(float(np.max(uniq_y)), float(np.min(uniq_y)), int(max(2, samples)))
+        sample_xs = np.polyval(coef, sample_ys)
     except np.linalg.LinAlgError:
-        return [(int(round(x)), int(round(y))) for x, y in pts_xy]
+        sample_ys = np.linspace(float(np.max(uniq_y)), float(np.min(uniq_y)), int(max(2, samples)))
+        sample_xs = np.interp(sample_ys, uniq_y[::-1], uniq_x[::-1])
 
-    y_start = float(np.max(uniq_y))
-    y_end = float(np.min(uniq_y))
-    sample_ys = np.linspace(y_start, y_end, int(max(2, samples)))
-    sample_xs = np.polyval(coef, sample_ys)
-
+    sample_xs = _moving_average_1d(sample_xs.astype(np.float32), smooth_window)
     out = []
     out_h = out_hw[0] if out_hw is not None else None
     out_w = out_hw[1] if out_hw is not None else None
@@ -53,7 +76,9 @@ def fit_poly_centerline(pts_xy, degree: int = 2, samples: int = 32, out_hw: tupl
 
 
 def _interp_x_from_polyline(polyline, ys_query):
-    pts = np.asarray(polyline, dtype=np.float32)
+    pts = _as_points_array(polyline)
+    if pts is None:
+        return np.zeros(len(ys_query), dtype=np.float32)
     ys = pts[:, 1]
     xs = pts[:, 0]
     order = np.argsort(ys)
@@ -67,58 +92,88 @@ def _interp_x_from_polyline(polyline, ys_query):
 
 
 def lane_guidance_penalty(path_pts_xy, lane_center_pts_xy, lane_width_px: float, weight: float = 1.0) -> float:
-    if path_pts_xy is None or lane_center_pts_xy is None:
+    path = _as_points_array(path_pts_xy)
+    lane = _as_points_array(lane_center_pts_xy)
+    if path is None or lane is None:
         return 0.0
-    if len(path_pts_xy) < 2 or len(lane_center_pts_xy) < 2:
-        return 0.0
-    path = np.asarray(path_pts_xy, dtype=np.float32)
     ys = path[:, 1]
-    pred_x = _interp_x_from_polyline(lane_center_pts_xy, ys)
+    pred_x = _interp_x_from_polyline(lane, ys)
     dx = np.abs(path[:, 0] - pred_x)
     lane_width_px = float(max(8.0, lane_width_px))
     return float(weight) * float(np.mean(dx / lane_width_px))
 
 
 def blend_centerlines(primary_pts_xy, guide_pts_xy, weight: float = 0.35):
-    if primary_pts_xy is None or guide_pts_xy is None:
+    primary = _as_points_array(primary_pts_xy)
+    guide = _as_points_array(guide_pts_xy)
+    if primary is None or guide is None:
         return primary_pts_xy
-    if len(primary_pts_xy) < 2 or len(guide_pts_xy) < 2:
-        return primary_pts_xy
-    primary = np.asarray(primary_pts_xy, dtype=np.float32)
     ys = primary[:, 1]
-    gx = _interp_x_from_polyline(guide_pts_xy, ys)
+    gx = _interp_x_from_polyline(guide, ys)
     w = float(np.clip(weight, 0.0, 1.0))
     out = []
     for (px, py), guide_x in zip(primary, gx):
-        x = (1.0 - w) * px + w * guide_x
+        x = (1.0 - w) * float(px) + w * float(guide_x)
         out.append((int(round(x)), int(round(py))))
     return out
 
 
+def shift_centerline(center_pts_xy, offset_px: float):
+    pts = _as_points_array(center_pts_xy)
+    if pts is None:
+        return center_pts_xy
+    offset_px = float(offset_px)
+    out = []
+    n = len(pts)
+    for i, p in enumerate(pts):
+        p0 = pts[i - 1] if i > 0 else pts[i]
+        p1 = pts[i + 1] if i < n - 1 else pts[i]
+        tangent = p1 - p0
+        dx = float(tangent[0])
+        dy = float(tangent[1])
+        norm = float((dx * dx + dy * dy) ** 0.5)
+        if norm < 1e-6:
+            nx, ny = 1.0, 0.0
+        else:
+            dx /= norm
+            dy /= norm
+            nx, ny = -dy, dx
+        out.append((int(round(float(p[0]) + nx * offset_px)), int(round(float(p[1]) + ny * offset_px))))
+    return out
+
+
+def smooth_centerline_x(pts_xy, window: int = 5):
+    pts = _as_points_array(pts_xy)
+    if pts is None:
+        return pts_xy
+    xs = _moving_average_1d(pts[:, 0], window)
+    out = [(int(round(x)), int(round(y))) for x, y in zip(xs, pts[:, 1])]
+    return out
+
+
 def clamp_polyline_shift(cur_pts_xy, prev_pts_xy, max_shift_px: float = 50.0):
-    if cur_pts_xy is None or prev_pts_xy is None:
+    cur = _as_points_array(cur_pts_xy)
+    prev = _as_points_array(prev_pts_xy)
+    if cur is None or prev is None:
         return cur_pts_xy
-    if len(cur_pts_xy) < 2 or len(prev_pts_xy) < 2:
-        return cur_pts_xy
-    cur = np.asarray(cur_pts_xy, dtype=np.float32)
     ys = cur[:, 1]
-    prev_x = _interp_x_from_polyline(prev_pts_xy, ys)
+    prev_x = _interp_x_from_polyline(prev, ys)
     dx = np.clip(cur[:, 0] - prev_x, -float(max_shift_px), float(max_shift_px))
     out = []
-    for x, y, dd in zip(prev_x + dx, ys, dx):
+    for x, y in zip(prev_x + dx, ys):
         out.append((int(round(x)), int(round(y))))
     return out
 
 
 def limit_centerline_curvature(pts_xy, max_dx_per_step: float = 24.0):
-    if pts_xy is None or len(pts_xy) < 3:
+    pts = _as_points_array(pts_xy)
+    if pts is None or len(pts) < 3:
         return pts_xy
-    pts = [(float(x), float(y)) for x, y in pts_xy]
-    out = [pts[0]]
+    out = [(float(pts[0, 0]), float(pts[0, 1]))]
     prev_dx = 0.0
     for i in range(1, len(pts)):
         x_prev, y_prev = out[-1]
-        x, y = pts[i]
+        x, y = float(pts[i, 0]), float(pts[i, 1])
         raw_dx = x - x_prev
         dx = float(np.clip(raw_dx, prev_dx - max_dx_per_step, prev_dx + max_dx_per_step))
         out.append((x_prev + dx, y))
@@ -127,14 +182,15 @@ def limit_centerline_curvature(pts_xy, max_dx_per_step: float = 24.0):
 
 
 def trim_polyline_to_mask(pts_xy, mask_u8, min_keep: int = 8):
-    if pts_xy is None or len(pts_xy) < 2 or mask_u8 is None:
+    pts = _as_points_array(pts_xy)
+    if pts is None or mask_u8 is None:
         return pts_xy
     h, w = mask_u8.shape[:2]
     kept = []
     misses = 0
-    for x, y in pts_xy:
-        xi = int(np.clip(round(x), 0, w - 1))
-        yi = int(np.clip(round(y), 0, h - 1))
+    for x, y in pts:
+        xi = int(np.clip(round(float(x)), 0, w - 1))
+        yi = int(np.clip(round(float(y)), 0, h - 1))
         if mask_u8[yi, xi] > 0:
             kept.append((xi, yi))
             misses = 0
@@ -146,13 +202,12 @@ def trim_polyline_to_mask(pts_xy, mask_u8, min_keep: int = 8):
 
 
 def build_metric_corridor_edges(center_pts_xy, half_width_m: float, meters_per_pixel_x: float, meters_per_pixel_y: float, out_hw: tuple[int, int] | None = None):
-    if center_pts_xy is None or len(center_pts_xy) < 2:
+    pts = _as_points_array(center_pts_xy)
+    if pts is None:
         return None, None
 
-    pts = np.asarray(center_pts_xy, dtype=np.float32)
     left = []
     right = []
-
     mpp_x = float(max(1e-6, meters_per_pixel_x))
     mpp_y = float(max(1e-6, meters_per_pixel_y))
     half_width_m = float(max(0.05, half_width_m))
@@ -166,6 +221,7 @@ def build_metric_corridor_edges(center_pts_xy, half_width_m: float, meters_per_p
 
         dx_px = float(p1[0] - p0[0])
         dy_px = float(p1[1] - p0[1])
+
         tx_m = dx_px * mpp_x
         ty_m = dy_px * mpp_y
         norm = float((tx_m * tx_m + ty_m * ty_m) ** 0.5)

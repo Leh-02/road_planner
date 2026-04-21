@@ -1,4 +1,3 @@
-
 import cv2
 import numpy as np
 
@@ -126,6 +125,19 @@ def _clip_points_to_frame(pts_xy, H, W):
     return out
 
 
+def _trim_large_steps(pts_xy, max_step_px: float = 150.0):
+    if pts_xy is None or len(pts_xy) < 2:
+        return pts_xy
+    out = [pts_xy[0]]
+    for pt in pts_xy[1:]:
+        prev = out[-1]
+        d = float(((pt[0] - prev[0]) ** 2 + (pt[1] - prev[1]) ** 2) ** 0.5)
+        if d > float(max_step_px):
+            break
+        out.append(pt)
+    return out
+
+
 def draw_guidance_corridor(
     frame_bgr,
     pts_xy,
@@ -186,6 +198,7 @@ def draw_projected_corridor(
     edge_thickness=3,
     center_thickness=4,
     fill_alpha=0.34,
+    max_step_px: float = 150.0,
 ):
     out = frame_bgr.copy()
     if center_pts_xy is None or left_pts_xy is None or right_pts_xy is None:
@@ -194,9 +207,17 @@ def draw_projected_corridor(
         return out
 
     H, W = out.shape[:2]
-    center_pts_xy = _clip_points_to_frame(center_pts_xy, H, W)
-    left_pts_xy = _clip_points_to_frame(left_pts_xy, H, W)
-    right_pts_xy = _clip_points_to_frame(right_pts_xy, H, W)
+    center_pts_xy = _trim_large_steps(_clip_points_to_frame(center_pts_xy, H, W), max_step_px=max_step_px)
+    left_pts_xy = _trim_large_steps(_clip_points_to_frame(left_pts_xy, H, W), max_step_px=max_step_px)
+    right_pts_xy = _trim_large_steps(_clip_points_to_frame(right_pts_xy, H, W), max_step_px=max_step_px)
+
+    n = min(len(center_pts_xy), len(left_pts_xy), len(right_pts_xy))
+    if n < 2:
+        return out
+
+    center_pts_xy = center_pts_xy[:n]
+    left_pts_xy = left_pts_xy[:n]
+    right_pts_xy = right_pts_xy[:n]
 
     poly = np.array(left_pts_xy + right_pts_xy[::-1], dtype=np.int32).reshape(-1, 1, 2)
     fill_layer = np.zeros_like(out, dtype=np.uint8)

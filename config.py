@@ -57,15 +57,21 @@ class Config:
     use_lane_detection: bool = True
     lane_min_confidence: float = 0.22
     lane_hold_frames: int = 12
-    lane_samples: int = 24
-    lane_top_y_ratio: float = 0.18
+    lane_samples: int = 28
+    lane_top_y_ratio: float = 0.16
     lane_width_m: float = 3.5
-    lane_search_margin_m: float = 2.4
+    lane_search_margin_m: float = 2.6
     lane_marking_morph_kernel: int = 5
     lane_marking_debug_alpha: float = 0.10
-    lane_center_penalty_weight: float = 0.010
-    lane_center_blend_weight: float = 0.38
-    lane_boundary_trust_threshold: float = 0.40
+
+    # Make the lane the main guidance source when markings are available.
+    lane_center_penalty_weight: float = 0.028
+    lane_center_blend_weight: float = 0.45
+    lane_primary_blend_weight: float = 0.78
+    lane_change_blend_weight: float = 0.62
+    lane_boundary_trust_threshold: float = 0.42
+    lane_smooth_window: int = 5
+    lane_change_target_offset_scale: float = 1.00
 
     # --- Obstacle relevance filtering ---
     use_lane_relevance_filter: bool = True
@@ -110,8 +116,10 @@ class Config:
     # --- Corridor quality / persistence ---
     min_path_points: int = 8
     corridor_hold_frames: int = 14
-    max_polyline_shift_px: float = 55.0
-    max_curve_dx_per_step_px: float = 26.0
+    max_polyline_shift_px: float = 46.0
+    max_curve_dx_per_step_px: float = 20.0
+    centerline_smooth_window: int = 7
+    projected_max_step_px: float = 150.0
 
     # --- Centerline fitting ---
     use_polyfit_centerline: bool = True
@@ -127,10 +135,11 @@ class Config:
     best_path_resample_points: int = 32
     centerline_smooth_alpha: float = 0.35
     corridor_half_width_m: float = 1.5
+    corridor_lane_fill_scale: float = 0.92
 
     corridor_start_half_width_px: int = 88
     corridor_end_half_width_px: int = 18
-    corridor_alpha: float = 0.34
+    corridor_alpha: float = 0.30
     best_corridor_fill_color: tuple[int, int, int] = (255, 140, 0)
     best_corridor_edge_color: tuple[int, int, int] = (255, 255, 255)
     best_corridor_center_color: tuple[int, int, int] = (0, 255, 255)
@@ -139,7 +148,8 @@ class Config:
     best_corridor_center_thickness_px: int = 4
     arrow_thickness_px: int = 5
 
-    draw_lane_guides: bool = True
+    # Keep this OFF by default to avoid drawing a second corridor.
+    draw_lane_guides: bool = False
     lane_left_color: tuple[int, int, int] = (255, 255, 255)
     lane_right_color: tuple[int, int, int] = (255, 255, 255)
     lane_center_color: tuple[int, int, int] = (0, 220, 255)

@@ -10,9 +10,7 @@ class LaneDetector:
         hls = cv2.cvtColor(bev_bgr, cv2.COLOR_BGR2HLS)
         hsv = cv2.cvtColor(bev_bgr, cv2.COLOR_BGR2HSV)
 
-        # white lines
         white_mask = cv2.inRange(hls, (0, 180, 0), (180, 255, 120))
-        # yellow lines
         yellow_mask = cv2.inRange(hsv, (10, 40, 90), (45, 255, 255))
 
         gray = cv2.cvtColor(bev_bgr, cv2.COLOR_BGR2GRAY)
@@ -55,6 +53,23 @@ class LaneDetector:
         cv2.fillPoly(mask, [poly], 255, lineType=cv2.LINE_AA)
         return mask
 
+    @staticmethod
+    def _smooth_pts(pts_xy, window: int = 5):
+        if pts_xy is None or len(pts_xy) < 3:
+            return pts_xy
+        if window <= 1:
+            return pts_xy
+        if window % 2 == 0:
+            window += 1
+        arr = np.asarray(pts_xy, dtype=np.float32)
+        xs = arr[:, 0]
+        ys = arr[:, 1]
+        pad = window // 2
+        padded = np.pad(xs, (pad, pad), mode="edge")
+        kernel = np.ones(window, dtype=np.float32) / float(window)
+        xs_s = np.convolve(padded, kernel, mode="valid")
+        return [(int(round(x)), int(round(y))) for x, y in zip(xs_s, ys)]
+
     def detect(self, frame_bgr, road_bev_u8, bev, prev_center_bev=None):
         bev_bgr = bev.warp_image(frame_bgr)
         markings = self._threshold_lane_markings(bev_bgr)
@@ -82,6 +97,7 @@ class LaneDetector:
             road_cols = np.where(road[y] > 0)[0]
             if road_cols.size < 8:
                 continue
+
             support_rows += 1
             road_left = float(road_cols[0])
             road_right = float(road_cols[-1])
@@ -114,7 +130,7 @@ class LaneDetector:
                 left_x = left_mark
                 right_x = left_mark + lane_width_px
                 marking_hits += 1
-            elif right_mark is not None and left_mark is None:
+            else:
                 right_x = right_mark
                 left_x = right_mark - lane_width_px
                 marking_hits += 1
@@ -129,7 +145,7 @@ class LaneDetector:
                 continue
 
             center_x = 0.5 * (left_x + right_x)
-            center_guess = 0.82 * center_guess + 0.18 * center_x
+            center_guess = 0.84 * center_guess + 0.16 * center_x
 
             left_pts.append((int(round(left_x)), int(y)))
             right_pts.append((int(round(right_x)), int(y)))
@@ -146,6 +162,11 @@ class LaneDetector:
                 "confidence": 0.0,
                 "lane_width_px": lane_width_px,
             }
+
+        smooth_window = int(max(1, self.cfg.lane_smooth_window))
+        left_pts = self._smooth_pts(left_pts, smooth_window)
+        right_pts = self._smooth_pts(right_pts, smooth_window)
+        center_pts = self._smooth_pts(center_pts, smooth_window)
 
         lane_mask = self._poly_mask_from_edges((h, w), left_pts, right_pts)
         relevance_mask = None
