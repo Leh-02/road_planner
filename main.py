@@ -318,7 +318,7 @@ def corridor_half_width_from_lane(lane_info, cfg: Config):
     return max(0.8, lane_half_m)
 
 
-def corridor_from_previous_bev(vis, central_road, st: PlannerState, bev: BEVProjector, cfg: Config, lane_info=None):
+def corridor_from_previous_bev(vis, central_road, st: PlannerState, bev: BEVProjector, cfg: Config, lane_info=None, focus_vehicle=None):
     if st.prev_centerline_bev is None or len(st.prev_centerline_bev) < 2:
         return vis
 
@@ -336,6 +336,7 @@ def corridor_from_previous_bev(vis, central_road, st: PlannerState, bev: BEVProj
     center_img = bev.bev_to_image_points(st.prev_centerline_bev)
     left_img = bev.bev_to_image_points(left_bev)
     right_img = bev.bev_to_image_points(right_bev)
+    lead_box = focus_vehicle["box"] if focus_vehicle is not None else None
     vis = draw_projected_corridor(
         vis,
         center_img,
@@ -349,8 +350,21 @@ def corridor_from_previous_bev(vis, central_road, st: PlannerState, bev: BEVProj
         center_thickness=cfg.best_corridor_center_thickness_px,
         fill_alpha=cfg.corridor_alpha,
         max_step_px=cfg.projected_max_step_px,
+        top_y_ratio=cfg.corridor_display_top_y_ratio,
+        lead_box=lead_box,
+        stop_margin_px=cfg.lead_vehicle_stop_margin_px,
+        min_points=cfg.projected_min_visible_points,
+        fallback_centerline=cfg.render_fallback_centerline_when_polygon_fails,
     )
-    vis = draw_direction_arrow(vis, center_img, color=cfg.best_path_text_color, thickness=cfg.arrow_thickness_px)
+    vis = draw_direction_arrow(
+        vis,
+        center_img,
+        color=cfg.best_path_text_color,
+        thickness=cfg.arrow_thickness_px,
+        top_y_ratio=cfg.corridor_display_top_y_ratio,
+        lead_box=lead_box,
+        stop_margin_px=cfg.lead_vehicle_stop_margin_px,
+    )
     return vis
 
 
@@ -626,6 +640,7 @@ def main():
                     center_img = bev.bev_to_image_points(pts_best)
                     left_img = bev.bev_to_image_points(left_bev)
                     right_img = bev.bev_to_image_points(right_bev)
+                    lead_box = focus_vehicle["box"] if focus_vehicle is not None else None
                     vis = draw_projected_corridor(
                         vis,
                         center_img,
@@ -639,8 +654,21 @@ def main():
                         center_thickness=cfg.best_corridor_center_thickness_px,
                         fill_alpha=cfg.corridor_alpha,
                         max_step_px=cfg.projected_max_step_px,
+                        top_y_ratio=cfg.corridor_display_top_y_ratio,
+                        lead_box=lead_box,
+                        stop_margin_px=cfg.lead_vehicle_stop_margin_px,
+                        min_points=cfg.projected_min_visible_points,
+                        fallback_centerline=cfg.render_fallback_centerline_when_polygon_fails,
                     )
-                    vis = draw_direction_arrow(vis, center_img, color=cfg.best_path_text_color, thickness=cfg.arrow_thickness_px)
+                    vis = draw_direction_arrow(
+                        vis,
+                        center_img,
+                        color=cfg.best_path_text_color,
+                        thickness=cfg.arrow_thickness_px,
+                        top_y_ratio=cfg.corridor_display_top_y_ratio,
+                        lead_box=lead_box,
+                        stop_margin_px=cfg.lead_vehicle_stop_margin_px,
+                    )
             else:
                 pts_best = limit_centerline_curvature(pts_best, max_dx_per_step=cfg.max_curve_dx_per_step_px)
                 pts_best = clamp_polyline_shift(pts_best, st.prev_centerline_img, max_shift_px=cfg.max_polyline_shift_px)
@@ -664,7 +692,7 @@ def main():
         else:
             st.corridor_miss_count += 1
             if bev is not None and st.corridor_miss_count <= cfg.corridor_hold_frames:
-                vis = corridor_from_previous_bev(vis, central_road, st, bev, cfg, lane_info=lane_info)
+                vis = corridor_from_previous_bev(vis, central_road, st, bev, cfg, lane_info=lane_info, focus_vehicle=focus_vehicle)
             elif st.prev_centerline_img is not None and len(st.prev_centerline_img) >= 2 and st.corridor_miss_count <= cfg.corridor_hold_frames:
                 vis = draw_guidance_corridor(
                     vis,

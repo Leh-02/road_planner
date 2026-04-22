@@ -70,6 +70,22 @@ class LaneDetector:
         xs_s = np.convolve(padded, kernel, mode="valid")
         return [(int(round(x)), int(round(y))) for x, y in zip(xs_s, ys)]
 
+    @staticmethod
+    def _interp_x_from_polyline(polyline, y_query: float):
+        if polyline is None or len(polyline) < 2:
+            return None
+        pts = np.asarray(polyline, dtype=np.float32)
+        ys = pts[:, 1]
+        xs = pts[:, 0]
+        order = np.argsort(ys)
+        ys = ys[order]
+        xs = xs[order]
+        ys_unique, idx = np.unique(ys, return_index=True)
+        xs_unique = xs[idx]
+        if ys_unique.size < 2:
+            return float(xs_unique[0]) if xs_unique.size else None
+        return float(np.interp(float(y_query), ys_unique, xs_unique))
+
     def detect(self, frame_bgr, road_bev_u8, bev, prev_center_bev=None):
         bev_bgr = bev.warp_image(frame_bgr)
         markings = self._threshold_lane_markings(bev_bgr)
@@ -92,6 +108,7 @@ class LaneDetector:
         center_pts = []
         marking_hits = 0
         support_rows = 0
+        history_guided_rows = 0
 
         for y in ys:
             road_cols = np.where(road[y] > 0)[0]
@@ -101,13 +118,19 @@ class LaneDetector:
             support_rows += 1
             road_left = float(road_cols[0])
             road_right = float(road_cols[-1])
-            row_centers = self._segment_centers(markings[y])
 
+            row_center_guess = center_guess
+            prev_x = self._interp_x_from_polyline(prev_center_bev, float(y))
+            if prev_x is not None:
+                row_center_guess = float(np.clip(prev_x, road_left, road_right))
+                history_guided_rows += 1
+
+            row_centers = self._segment_centers(markings[y])
             left_mark = None
             right_mark = None
             if row_centers:
-                cand_left = [c for c in row_centers if c < center_guess and center_guess - c <= search_margin_px]
-                cand_right = [c for c in row_centers if c > center_guess and c - center_guess <= search_margin_px]
+                cand_left = [c for c in row_centers if c < row_center_guess and row_center_guess - c <= search_margin_px]
+                cand_right = [c for c in row_centers if c > row_center_guess and c - row_center_guess <= search_margin_px]
                 if cand_left:
                     left_mark = float(max(cand_left))
                 if cand_right:
@@ -124,8 +147,8 @@ class LaneDetector:
                     right_mark = None
 
             if left_mark is None and right_mark is None:
-                left_x = center_guess - lane_width_px * 0.5
-                right_x = center_guess + lane_width_px * 0.5
+                left_x = row_center_guess - lane_width_px * 0.5
+                right_x = row_center_guess + lane_width_px * 0.5
             elif left_mark is not None and right_mark is None:
                 left_x = left_mark
                 right_x = left_mark + lane_width_px
@@ -138,14 +161,15 @@ class LaneDetector:
             left_x = max(road_left, left_x)
             right_x = min(road_right, right_x)
             if right_x - left_x < 0.45 * lane_width_px:
-                c = float(np.clip(center_guess, road_left, road_right))
+                c = float(np.clip(row_center_guess, road_left, road_right))
                 left_x = max(road_left, c - lane_width_px * 0.5)
                 right_x = min(road_right, c + lane_width_px * 0.5)
             if right_x <= left_x:
                 continue
 
             center_x = 0.5 * (left_x + right_x)
-            center_guess = 0.84 * center_guess + 0.16 * center_x
+            blend = 0.26 if prev_x is None else 0.18
+            center_guess = (1.0 - blend) * center_guess + blend * center_x
 
             left_pts.append((int(round(left_x)), int(y)))
             right_pts.append((int(round(right_x)), int(y)))
@@ -176,7 +200,10 @@ class LaneDetector:
             relevance_mask = cv2.dilate(lane_mask, np.ones((2 * margin_px + 1, 2 * margin_px + 1), np.uint8))
             relevance_mask = cv2.bitwise_and(relevance_mask, road)
 
-        confidence = 0.65 * (marking_hits / max(1, support_rows)) + 0.35 * (len(center_pts) / max(1, len(ys)))
+        mark_score = marking_hits / max(1, support_rows)
+        coverage_score = len(center_pts) / max(1, len(ys))
+        history_score = history_guided_rows / max(1, support_rows)
+        confidence = 0.55 * mark_score + 0.30 * coverage_score + 0.15 * history_score
         confidence = float(np.clip(confidence, 0.0, 1.0))
 
         return {

@@ -120,6 +120,10 @@ class Config:
     max_curve_dx_per_step_px: float = 20.0
     centerline_smooth_window: int = 7
     projected_max_step_px: float = 150.0
+    projected_min_visible_points: int = 6
+    corridor_display_top_y_ratio: float = 0.18
+    lead_vehicle_stop_margin_px: int = 16
+    render_fallback_centerline_when_polygon_fails: bool = True
 
     # --- Centerline fitting ---
     use_polyfit_centerline: bool = True
@@ -139,13 +143,13 @@ class Config:
 
     corridor_start_half_width_px: int = 88
     corridor_end_half_width_px: int = 18
-    corridor_alpha: float = 0.30
+    corridor_alpha: float = 0.26
     best_corridor_fill_color: tuple[int, int, int] = (255, 140, 0)
     best_corridor_edge_color: tuple[int, int, int] = (255, 255, 255)
     best_corridor_center_color: tuple[int, int, int] = (0, 255, 255)
     best_path_text_color: tuple[int, int, int] = (0, 255, 255)
     best_corridor_edge_thickness_px: int = 3
-    best_corridor_center_thickness_px: int = 4
+    best_corridor_center_thickness_px: int = 5
     arrow_thickness_px: int = 5
 
     # Keep this OFF by default to avoid drawing a second corridor.
