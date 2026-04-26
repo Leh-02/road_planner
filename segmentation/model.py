@@ -1,4 +1,5 @@
 import os
+import warnings
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -16,11 +17,20 @@ class RoadSegmenter:
         self.max_side = int(max_side) if max_side and max_side > 0 else None
         self.model_id = model_id
 
-        self.processor = AutoImageProcessor.from_pretrained(
-            model_id,
-            use_fast=False,
-            local_files_only=True,
-        )
+        # Some SegFormer checkpoints contain old keys in preprocessor_config.json
+        # (feature_extractor_type, reduce_labels). Transformers ignores them, but
+        # prints a warning on every run. It is harmless, so keep the console clean.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"The following named arguments are not valid for `SegformerImageProcessor.__init__`.*",
+                category=UserWarning,
+            )
+            self.processor = AutoImageProcessor.from_pretrained(
+                model_id,
+                use_fast=False,
+                local_files_only=True,
+            )
         self.model = SegformerForSemanticSegmentation.from_pretrained(
             model_id,
             local_files_only=True,

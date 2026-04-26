@@ -16,7 +16,7 @@ class Config:
 
     # --- YOLO ---
     yolo_model: str = "yolov8n.pt"
-    yolo_conf: float = 0.35
+    yolo_conf: float = 0.30
     yolo_imgsz: int = 960
     obstacle_names: tuple[str, ...] = ("person", "bicycle", "motorcycle", "car", "bus", "truck")
 
@@ -49,25 +49,25 @@ class Config:
 
     # --- Temporal fusion ---
     road_ema_alpha: float = 0.80
-    obstacle_ema_alpha: float = 0.70
+    obstacle_ema_alpha: float = 0.58
     road_prob_threshold: float = 0.45
-    obstacle_prob_threshold: float = 0.35
+    obstacle_prob_threshold: float = 0.30
 
     # --- Lane detection / lane prior ---
     use_lane_detection: bool = True
-    lane_min_confidence: float = 0.22
-    lane_hold_frames: int = 12
-    lane_samples: int = 28
-    lane_top_y_ratio: float = 0.16
+    lane_min_confidence: float = 0.25
+    lane_hold_frames: int = 18
+    lane_samples: int = 30
+    lane_top_y_ratio: float = 0.20
     lane_width_m: float = 3.5
-    lane_search_margin_m: float = 2.6
+    lane_search_margin_m: float = 2.8
     lane_marking_morph_kernel: int = 5
     lane_marking_debug_alpha: float = 0.10
 
-    # Make the lane the main guidance source when markings are available.
-    lane_center_penalty_weight: float = 0.028
+    # Visible markings should dominate the centerline, but only when they are actually trusted.
+    lane_center_penalty_weight: float = 0.035
     lane_center_blend_weight: float = 0.45
-    lane_primary_blend_weight: float = 0.78
+    lane_primary_blend_weight: float = 0.82
     lane_change_blend_weight: float = 0.62
     lane_boundary_trust_threshold: float = 0.42
     lane_smooth_window: int = 5
@@ -75,23 +75,23 @@ class Config:
 
     # --- Obstacle relevance filtering ---
     use_lane_relevance_filter: bool = True
-    obstacle_lane_margin_m: float = 0.80
+    obstacle_lane_margin_m: float = 1.10
     obstacle_must_touch_road: bool = True
 
     # --- Grid / planning ---
     cell: int = 8
     inflate_cells: int = 2
-    goal_y_ratio: float = 0.22
-    start_search_rows_up: int = 16
-    astar_w_clear: float = 1.35
+    goal_y_ratio: float = 0.30
+    start_search_rows_up: int = 22
+    astar_w_clear: float = 1.25
     astar_w_turn: float = 0.04
     goal_continuity_penalty: float = 0.004
-    path_clearance_penalty: float = 24.0
+    path_clearance_penalty: float = 18.0
 
     # --- Goal sampling ---
-    max_branches: int = 5
-    branch_min_width_cells: int = 6
-    branch_multi_path_min_width_cells: int = 14
+    max_branches: int = 7
+    branch_min_width_cells: int = 5
+    branch_multi_path_min_width_cells: int = 12
     branch_side_sample_ratio: float = 0.22
     branch_label_deadband_cells: int = 2
 
@@ -100,29 +100,29 @@ class Config:
     avoid_roi_y2_ratio: float = 0.98
     lookahead_row_ratio: float = 0.68
     keep_avoid_until_clear: bool = True
-    blocking_obstacle_bottom_px: int = 420
+    blocking_obstacle_bottom_px: int = 455
     obstacle_goal_margin_cells: int = 8
-    obstacle_goal_penalty: float = 9.0
+    obstacle_goal_penalty: float = 12.0
 
     # --- Lane-change / focus vehicle ---
-    lane_change_trigger_bottom_px: int = 320
-    lane_change_center_band_ratio: float = 0.85
+    lane_change_trigger_bottom_px: int = 360
+    lane_change_center_band_ratio: float = 0.82
     lane_change_probe_up_cells: int = 12
     lane_change_vehicle_names: tuple[str, ...] = ("car", "bus", "truck", "motorcycle")
-    lane_change_hold_frames: int = 16
-    center_goal_penalty: float = 16.0
-    wrong_side_penalty: float = 42.0
+    lane_change_hold_frames: int = 20
+    center_goal_penalty: float = 18.0
+    wrong_side_penalty: float = 48.0
 
     # --- Corridor quality / persistence ---
-    min_path_points: int = 8
-    corridor_hold_frames: int = 14
-    max_polyline_shift_px: float = 46.0
-    max_curve_dx_per_step_px: float = 20.0
+    min_path_points: int = 6
+    corridor_hold_frames: int = 24
+    max_polyline_shift_px: float = 54.0
+    max_curve_dx_per_step_px: float = 22.0
     centerline_smooth_window: int = 7
-    projected_max_step_px: float = 150.0
-    projected_min_visible_points: int = 6
-    corridor_display_top_y_ratio: float = 0.18
-    lead_vehicle_stop_margin_px: int = 16
+    projected_max_step_px: float = 220.0
+    projected_min_visible_points: int = 4
+    corridor_display_top_y_ratio: float = 0.24
+    lead_vehicle_stop_margin_px: int = 18
     render_fallback_centerline_when_polygon_fails: bool = True
 
     # --- Centerline fitting ---
@@ -138,11 +138,11 @@ class Config:
 
     best_path_resample_points: int = 32
     centerline_smooth_alpha: float = 0.35
-    corridor_half_width_m: float = 1.5
-    corridor_lane_fill_scale: float = 0.92
+    corridor_half_width_m: float = 1.35
+    corridor_lane_fill_scale: float = 0.86
 
-    corridor_start_half_width_px: int = 88
-    corridor_end_half_width_px: int = 18
+    corridor_start_half_width_px: int = 80
+    corridor_end_half_width_px: int = 16
     corridor_alpha: float = 0.26
     best_corridor_fill_color: tuple[int, int, int] = (255, 140, 0)
     best_corridor_edge_color: tuple[int, int, int] = (255, 255, 255)
@@ -158,4 +158,5 @@ class Config:
     lane_right_color: tuple[int, int, int] = (255, 255, 255)
     lane_center_color: tuple[int, int, int] = (0, 220, 255)
 
+    # False is safer for unstable SegFormer masks; otherwise a bad road mask can hide the corridor.
     clip_best_corridor_to_road: bool = False

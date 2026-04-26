@@ -18,7 +18,7 @@ class ObstacleDetector:
         self.model = YOLO(model_path) if YOLO is not None else None
         self.names = {}
         if self.model is not None:
-            raw_names = getattr(self.model.model, 'names', None) or getattr(self.model, 'names', {})
+            raw_names = getattr(self.model.model, "names", None) or getattr(self.model, "names", {})
             self.names = {int(k): str(v) for k, v in dict(raw_names).items()}
 
     def detect(self, frame_bgr: np.ndarray):
@@ -26,25 +26,27 @@ class ObstacleDetector:
             return []
         result = self.model.predict(frame_bgr, conf=self.conf, imgsz=self.imgsz, verbose=False)[0]
         out = []
-        boxes = getattr(result, 'boxes', None)
+        boxes = getattr(result, "boxes", None)
         if boxes is None:
             return out
-        xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, 'cpu') else np.asarray(boxes.xyxy)
-        cls = boxes.cls.cpu().numpy() if hasattr(boxes.cls, 'cpu') else np.asarray(boxes.cls)
-        conf = boxes.conf.cpu().numpy() if hasattr(boxes.conf, 'cpu') else np.asarray(boxes.conf)
+        xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, "cpu") else np.asarray(boxes.xyxy)
+        cls = boxes.cls.cpu().numpy() if hasattr(boxes.cls, "cpu") else np.asarray(boxes.cls)
+        conf = boxes.conf.cpu().numpy() if hasattr(boxes.conf, "cpu") else np.asarray(boxes.conf)
         for (x1, y1, x2, y2), cls_id, score in zip(xyxy, cls, conf):
             cls_id = int(cls_id)
-            name = str(self.names.get(cls_id, '')).lower()
+            name = str(self.names.get(cls_id, "")).lower()
             if self.allowed_names and name not in self.allowed_names:
                 continue
-            out.append((
-                int(round(float(x1))),
-                int(round(float(y1))),
-                int(round(float(x2))),
-                int(round(float(y2))),
-                cls_id,
-                float(score),
-            ))
+            out.append(
+                (
+                    int(round(float(x1))),
+                    int(round(float(y1))),
+                    int(round(float(x2))),
+                    int(round(float(y2))),
+                    cls_id,
+                    float(score),
+                )
+            )
         return out
 
     @staticmethod

@@ -119,15 +119,13 @@ def _clip_points_to_frame(pts_xy, H, W):
         return None
     out = []
     for x, y in pts_xy:
-        if not np.isfinite(x) or not np.isfinite(y):
-            continue
         xi = int(np.clip(round(x), 0, W - 1))
         yi = int(np.clip(round(y), 0, H - 1))
         out.append((xi, yi))
     return out
 
 
-def _trim_large_steps(pts_xy, max_step_px: float = 150.0):
+def _trim_large_steps(pts_xy, max_step_px: float = 150.0, min_keep: int = 2):
     if pts_xy is None or len(pts_xy) < 2:
         return pts_xy
     out = [pts_xy[0]]
@@ -137,53 +135,23 @@ def _trim_large_steps(pts_xy, max_step_px: float = 150.0):
         if d > float(max_step_px):
             break
         out.append(pt)
-    return out
+    return out if len(out) >= min_keep else pts_xy[:min_keep]
 
 
-def _trim_to_top_y(pts_xy, top_y: int, min_keep: int = 2):
+def _trim_to_visible_near_range(pts_xy, H, W, top_y_ratio: float = 0.20, max_step_px: float = 150.0, min_points: int = 4):
     if pts_xy is None or len(pts_xy) < 2:
         return pts_xy
-    kept = []
-    for pt in pts_xy:
-        if pt[1] < top_y:
-            if len(kept) >= int(min_keep):
-                break
-            continue
-        kept.append(pt)
-    return kept if len(kept) >= 2 else pts_xy
+    pts = _clip_points_to_frame(pts_xy, H, W)
+    top_y = int(np.clip(top_y_ratio, 0.0, 0.95) * H)
 
+    # Keep the near-to-mid image range. Points beyond the horizon are the most unstable
+    # after inverse perspective projection and often create a huge jump in polygon edges.
+    visible = [p for p in pts if p[1] >= top_y]
+    if len(visible) < min_points:
+        visible = pts[:max(2, min(len(pts), min_points))]
 
-def _trim_before_lead_box(pts_xy, lead_box, stop_margin_px: int = 16, min_keep: int = 4):
-    if pts_xy is None or len(pts_xy) < 2 or lead_box is None:
-        return pts_xy
-    x1, y1, x2, y2, *_ = lead_box
-    x1 -= int(stop_margin_px)
-    x2 += int(stop_margin_px)
-    y_cut = int(y2 + stop_margin_px)
-
-    kept = []
-    for x, y in pts_xy:
-        if (x1 <= x <= x2 and y <= y_cut) or y <= int(y1):
-            if len(kept) >= int(min_keep):
-                break
-        kept.append((x, y))
-    return kept if len(kept) >= 2 else pts_xy
-
-
-def _polyline_pixels(layer):
-    return int(np.count_nonzero(np.any(layer > 0, axis=2)))
-
-
-def _draw_centerline_only(out, pts_xy, road_mask, center_color, center_thickness):
-    if pts_xy is None or len(pts_xy) < 2:
-        return out
-    center_layer = np.zeros_like(out, dtype=np.uint8)
-    cv2.polylines(center_layer, [np.array(pts_xy, dtype=np.int32).reshape(-1, 1, 2)], False, center_color, center_thickness, cv2.LINE_AA)
-    center_layer = _clip_layer_to_mask(center_layer, road_mask)
-    center_nz = np.any(center_layer > 0, axis=2)
-    if np.any(center_nz):
-        out[center_nz] = center_layer[center_nz]
-    return out
+    visible = _trim_large_steps(visible, max_step_px=max_step_px, min_keep=max(2, min_points))
+    return visible
 
 
 def draw_guidance_corridor(
@@ -247,10 +215,8 @@ def draw_projected_corridor(
     center_thickness=4,
     fill_alpha=0.34,
     max_step_px: float = 150.0,
-    top_y_ratio: float = 0.18,
-    lead_box=None,
-    stop_margin_px: int = 16,
-    min_points: int = 6,
+    top_y_ratio: float = 0.20,
+    min_visible_points: int = 4,
     fallback_centerline: bool = True,
 ):
     out = frame_bgr.copy()
@@ -260,44 +226,21 @@ def draw_projected_corridor(
         return out
 
     H, W = out.shape[:2]
-    top_y = int(np.clip(round(float(top_y_ratio) * H), 0, H - 1))
-
-    center_pts_xy = _clip_points_to_frame(center_pts_xy, H, W)
-    left_pts_xy = _clip_points_to_frame(left_pts_xy, H, W)
-    right_pts_xy = _clip_points_to_frame(right_pts_xy, H, W)
-
-    center_pts_xy = _trim_large_steps(center_pts_xy, max_step_px=max_step_px)
-    left_pts_xy = _trim_large_steps(left_pts_xy, max_step_px=max_step_px)
-    right_pts_xy = _trim_large_steps(right_pts_xy, max_step_px=max_step_px)
-
-    center_pts_xy = _trim_to_top_y(center_pts_xy, top_y=top_y, min_keep=min_points)
-    left_pts_xy = _trim_to_top_y(left_pts_xy, top_y=top_y, min_keep=min_points)
-    right_pts_xy = _trim_to_top_y(right_pts_xy, top_y=top_y, min_keep=min_points)
-
-    center_pts_xy = _trim_before_lead_box(center_pts_xy, lead_box, stop_margin_px=stop_margin_px, min_keep=min_points)
-    left_pts_xy = _trim_before_lead_box(left_pts_xy, lead_box, stop_margin_px=stop_margin_px, min_keep=min_points)
-    right_pts_xy = _trim_before_lead_box(right_pts_xy, lead_box, stop_margin_px=stop_margin_px, min_keep=min_points)
+    center_pts_xy = _trim_to_visible_near_range(center_pts_xy, H, W, top_y_ratio, max_step_px, min_visible_points)
+    left_pts_xy = _trim_to_visible_near_range(left_pts_xy, H, W, top_y_ratio, max_step_px, min_visible_points)
+    right_pts_xy = _trim_to_visible_near_range(right_pts_xy, H, W, top_y_ratio, max_step_px, min_visible_points)
 
     n = min(len(center_pts_xy), len(left_pts_xy), len(right_pts_xy))
     if n < 2:
+        if fallback_centerline and center_pts_xy is not None and len(center_pts_xy) >= 2:
+            cv2.polylines(out, [np.array(center_pts_xy, dtype=np.int32).reshape(-1, 1, 2)], False, center_color, center_thickness, cv2.LINE_AA)
         return out
 
     center_pts_xy = center_pts_xy[:n]
     left_pts_xy = left_pts_xy[:n]
     right_pts_xy = right_pts_xy[:n]
 
-    if n < int(max(2, min_points)):
-        if fallback_centerline:
-            return _draw_centerline_only(out, center_pts_xy, road_mask, center_color, center_thickness)
-        return out
-
     poly = np.array(left_pts_xy + right_pts_xy[::-1], dtype=np.int32).reshape(-1, 1, 2)
-    area = abs(float(cv2.contourArea(poly)))
-    if area < 32.0:
-        if fallback_centerline:
-            return _draw_centerline_only(out, center_pts_xy, road_mask, center_color, center_thickness)
-        return out
-
     fill_layer = np.zeros_like(out, dtype=np.uint8)
     edge_layer = np.zeros_like(out, dtype=np.uint8)
     center_layer = np.zeros_like(out, dtype=np.uint8)
@@ -311,9 +254,6 @@ def draw_projected_corridor(
     edge_layer = _clip_layer_to_mask(edge_layer, road_mask)
     center_layer = _clip_layer_to_mask(center_layer, road_mask)
 
-    if _polyline_pixels(center_layer) == 0 and fallback_centerline:
-        return _draw_centerline_only(out, center_pts_xy, road_mask, center_color, center_thickness)
-
     fill_nz = np.any(fill_layer > 0, axis=2)
     if np.any(fill_nz):
         out[fill_nz] = cv2.addWeighted(out[fill_nz], 1.0 - fill_alpha, fill_layer[fill_nz], fill_alpha, 0)
@@ -325,6 +265,8 @@ def draw_projected_corridor(
     center_nz = np.any(center_layer > 0, axis=2)
     if np.any(center_nz):
         out[center_nz] = center_layer[center_nz]
+    elif fallback_centerline and center_pts_xy is not None and len(center_pts_xy) >= 2:
+        cv2.polylines(out, [np.array(center_pts_xy, dtype=np.int32).reshape(-1, 1, 2)], False, center_color, center_thickness, cv2.LINE_AA)
 
     return out
 
@@ -340,28 +282,13 @@ def draw_focus_vehicle(frame_bgr, vehicle_info):
     return out
 
 
-def draw_direction_arrow(
-    frame_bgr,
-    pts_xy,
-    color=(0, 255, 255),
-    thickness=5,
-    tip_length=0.30,
-    top_y_ratio: float = 0.18,
-    lead_box=None,
-    stop_margin_px: int = 16,
-):
+def draw_direction_arrow(frame_bgr, pts_xy, color=(0, 255, 255), thickness=5, tip_length=0.30):
     if pts_xy is None or len(pts_xy) < 2:
         return frame_bgr
 
     out = frame_bgr.copy()
     H, W = out.shape[:2]
     pts_xy = _clip_points_to_frame(pts_xy, H, W)
-    pts_xy = _trim_large_steps(pts_xy, max_step_px=150.0)
-    pts_xy = _trim_to_top_y(pts_xy, top_y=int(np.clip(round(float(top_y_ratio) * H), 0, H - 1)), min_keep=4)
-    pts_xy = _trim_before_lead_box(pts_xy, lead_box, stop_margin_px=stop_margin_px, min_keep=4)
-    if pts_xy is None or len(pts_xy) < 2:
-        return out
-
     n = len(pts_xy)
     i0 = int(np.clip(round(n * 0.82), 1, n - 1))
     i1 = int(np.clip(round(n * 0.58), 0, n - 2))

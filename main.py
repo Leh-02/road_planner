@@ -53,22 +53,92 @@ def segments_from_row_free(row_free: np.ndarray):
     return segs
 
 
+def _nearest_free_col(row_free: np.ndarray, desired_c: int, preferred_side: str | None = None, center_c: int | None = None):
+    free_cols = np.where(row_free)[0]
+    if free_cols.size == 0:
+        return None
+
+    desired_c = int(np.clip(desired_c, 0, len(row_free) - 1))
+    if preferred_side in ("left", "right") and center_c is not None:
+        if preferred_side == "left":
+            side_cols = free_cols[free_cols < center_c]
+        else:
+            side_cols = free_cols[free_cols > center_c]
+        if side_cols.size > 0:
+            free_cols = side_cols
+
+    idx = int(np.argmin(np.abs(free_cols - desired_c)))
+    return int(free_cols[idx])
+
+
 def pick_start_cell(grid: np.ndarray, center_c: int, max_rows_up: int = 12):
     gh, gw = grid.shape
     center_c = int(np.clip(center_c, 0, gw - 1))
     bottom_r = max(1, gh - 2)
 
-    if grid[bottom_r, center_c] == 0:
-        return bottom_r, center_c
-
     for r in range(bottom_r, max(0, bottom_r - max_rows_up), -1):
-        free_cols = np.where(grid[r] == 0)[0]
-        if free_cols.size == 0:
-            continue
-        idx = int(np.argmin(np.abs(free_cols - center_c)))
-        return int(r), int(free_cols[idx])
+        c = _nearest_free_col(grid[r] == 0, center_c)
+        if c is not None:
+            return int(r), int(c)
 
-    return bottom_r, center_c
+    # Last chance: any free cell in the lower half of the grid.
+    for r in range(bottom_r, max(0, gh // 2), -1):
+        c = _nearest_free_col(grid[r] == 0, center_c)
+        if c is not None:
+            return int(r), int(c)
+    return None
+
+
+def resolve_goal_cell(grid: np.ndarray, desired_r: int, desired_c: int, preferred_side: str | None, center_c: int, max_row_delta: int = 16):
+    gh, gw = grid.shape
+    desired_r = int(np.clip(desired_r, 1, gh - 2))
+    desired_c = int(np.clip(desired_c, 0, gw - 1))
+    offsets = [0]
+    for d in range(1, max_row_delta + 1):
+        offsets.extend([-d, d])
+
+    for off in offsets:
+        r = desired_r + off
+        if not (1 <= r < gh - 1):
+            continue
+        c = _nearest_free_col(grid[r] == 0, desired_c, preferred_side=preferred_side, center_c=center_c)
+        if c is not None:
+            return int(r), int(c)
+    return None
+
+
+def greedy_fallback_centerline(grid: np.ndarray, start, goal_r: int, center_c: int, preferred_side: str | None, cell: int, samples: int = 32):
+    """Build a safe-enough centerline from free cells if A* fails.
+
+    This prevents the visual corridor from disappearing on frames where segmentation,
+    BEV, or obstacle inflation temporarily closes the search graph.
+    """
+    if start is None:
+        return None
+    gh, gw = grid.shape
+    sr, sc = start
+    goal_r = int(np.clip(goal_r, 1, gh - 2))
+    rows = np.linspace(sr, goal_r, int(max(6, samples))).astype(np.int32)
+    c_prev = int(sc)
+    pts = []
+    side_offset = max(3, int(round(gw * 0.16)))
+
+    for r in rows:
+        if preferred_side == "left":
+            desired = max(0, center_c - side_offset)
+        elif preferred_side == "right":
+            desired = min(gw - 1, center_c + side_offset)
+        else:
+            desired = c_prev
+        c = _nearest_free_col(grid[r] == 0, desired, preferred_side=preferred_side, center_c=center_c)
+        if c is None:
+            c = _nearest_free_col(grid[r] == 0, c_prev)
+        if c is None:
+            continue
+        c_prev = int(round(0.72 * c_prev + 0.28 * c))
+        pts.append((int(c_prev * cell + cell * 0.5), int(r * cell + cell * 0.5)))
+
+    return pts if len(pts) >= 2 else None
 
 
 def path_side_name(col: int, center_c: int, deadband_cells: int = 2):
@@ -96,32 +166,117 @@ def _pt_inside_mask(mask_u8, pt_xy):
     return bool(mask_u8[y, x] > 0)
 
 
+def _box_sample_points(box):
+    x1, y1, x2, y2, *_ = box
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+    xs = np.linspace(x1 + 0.15 * bw, x2 - 0.15 * bw, 5)
+    pts = [(float(x), float(y2)) for x in xs]
+    pts += [
+        (float(0.5 * (x1 + x2)), float(y1 + 0.82 * bh)),
+        (float(0.5 * (x1 + x2)), float(y1 + 0.92 * bh)),
+    ]
+    return pts
+
+
+def _box_touches_mask(box, mask_u8, bev: BEVProjector | None = None):
+    if mask_u8 is None:
+        return True
+    pts = _box_sample_points(box)
+    if bev is not None:
+        pts = bev.image_to_bev_points(pts)
+    return any(_pt_inside_mask(mask_u8, p) for p in pts)
+
+
 def filter_relevant_boxes(boxes, names_dict, frame_hw, cfg: Config, bev: BEVProjector | None, road_mask_for_planning, lane_relevance_mask_bev):
     out = []
     infos = []
     for box in boxes:
         x1, y1, x2, y2, cls_id, conf = box
         name = str(names_dict.get(cls_id, "")).lower()
-        bc_img = (0.5 * (x1 + x2), y2)
 
         relevant = True
         bev_bc = None
         if bev is not None:
-            proj = bev.image_to_bev_points([bc_img])
-            if proj:
-                bev_bc = proj[0]
-                if cfg.obstacle_must_touch_road:
-                    relevant = relevant and _pt_inside_mask(road_mask_for_planning, bev_bc)
-                if cfg.use_lane_relevance_filter and lane_relevance_mask_bev is not None:
-                    relevant = relevant and _pt_inside_mask(lane_relevance_mask_bev, bev_bc)
+            proj = bev.image_to_bev_points([(0.5 * (x1 + x2), y2)])
+            bev_bc = proj[0] if proj else None
+            if cfg.obstacle_must_touch_road:
+                relevant = relevant and _box_touches_mask(box, road_mask_for_planning, bev=bev)
+            if cfg.use_lane_relevance_filter and lane_relevance_mask_bev is not None:
+                # Apply this only for trusted lane masks. It removes parked/side cars but
+                # no longer drops a lead car just because one sample point is outside.
+                relevant = relevant and _box_touches_mask(box, lane_relevance_mask_bev, bev=bev)
         else:
             if cfg.obstacle_must_touch_road:
-                relevant = relevant and _pt_inside_mask(road_mask_for_planning, bc_img)
+                relevant = relevant and _box_touches_mask(box, road_mask_for_planning, bev=None)
 
         if relevant:
             out.append(box)
             infos.append({"box": box, "name": name, "bev_bottom_center": bev_bc})
     return out, infos
+
+
+def boxes_to_bev_footprint_mask(boxes, frame_hw, bev: BEVProjector, cfg: Config, road_mask_bev=None):
+    """Project only the lower footprint of each detection box into BEV.
+
+    Warping the whole YOLO rectangle makes a tall car box become a huge BEV polygon,
+    often blocking all lanes. For navigation we need the road contact footprint.
+    """
+    out = np.zeros((cfg.bev_height, cfg.bev_width), dtype=np.uint8)
+    H, W = frame_hw
+    for box in boxes:
+        x1, y1, x2, y2, *_ = box
+        x1 = float(np.clip(x1, 0, W - 1))
+        x2 = float(np.clip(x2, 0, W - 1))
+        y1 = float(np.clip(y1, 0, H - 1))
+        y2 = float(np.clip(y2, 0, H - 1))
+        bw = max(2.0, x2 - x1)
+        bh = max(2.0, y2 - y1)
+        if y2 <= y1 or x2 <= x1:
+            continue
+
+        side_margin = 0.08 * bw
+        top_margin = max(6.0, 0.28 * bh)
+        fy1 = max(y1, y2 - top_margin)
+        pts_img = [
+            (x1 - side_margin, y2),
+            (x2 + side_margin, y2),
+            (x2 + side_margin * 0.45, fy1),
+            (x1 - side_margin * 0.45, fy1),
+        ]
+        pts_bev = bev.image_to_bev_points(pts_img)
+        if len(pts_bev) < 3:
+            continue
+        pts = []
+        for x, y in pts_bev:
+            pts.append((int(np.clip(round(x), 0, cfg.bev_width - 1)), int(np.clip(round(y), 0, cfg.bev_height - 1))))
+        poly = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+        if abs(cv2.contourArea(poly)) < 2.0:
+            continue
+        cv2.fillPoly(out, [poly], 255, lineType=cv2.LINE_AA)
+
+    # Small metric inflation in BEV before grid inflation helps far objects remain visible.
+    extra_px = max(3, int(round(0.25 / max(1e-6, cfg.meters_per_pixel_x))))
+    out = cv2.dilate(out, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * extra_px + 1, 2 * extra_px + 1)), iterations=1)
+    if road_mask_bev is not None:
+        out = cv2.bitwise_and(out, cv2.dilate(road_mask_bev, np.ones((7, 7), np.uint8)))
+    return out
+
+
+def boxes_to_image_footprint_mask(boxes, shape_hw):
+    h, w = shape_hw
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for x1, y1, x2, y2, *_ in boxes:
+        bw = max(2, int(x2 - x1))
+        bh = max(2, int(y2 - y1))
+        y_top = int(round(y2 - max(6, 0.28 * bh)))
+        x1e = int(np.clip(x1 - 0.08 * bw, 0, w - 1))
+        x2e = int(np.clip(x2 + 0.08 * bw, 0, w - 1))
+        y_top = int(np.clip(y_top, 0, h - 1))
+        y2 = int(np.clip(y2, 0, h - 1))
+        if x2e > x1e and y2 > y_top:
+            cv2.rectangle(mask, (x1e, y_top), (x2e, y2), 255, thickness=-1)
+    return mask
 
 
 def pick_focus_vehicle(boxes, names_dict, frame_hw, cfg: Config):
@@ -315,16 +470,16 @@ def corridor_half_width_from_lane(lane_info, cfg: Config):
         return cfg.corridor_half_width_m
     lane_width_m = float(lane_width_px) * float(cfg.meters_per_pixel_x)
     lane_half_m = 0.5 * lane_width_m * float(cfg.corridor_lane_fill_scale)
-    return max(0.8, lane_half_m)
+    return max(0.75, min(1.65, lane_half_m))
 
 
-def corridor_from_previous_bev(vis, central_road, st: PlannerState, bev: BEVProjector, cfg: Config, lane_info=None, focus_vehicle=None):
-    if st.prev_centerline_bev is None or len(st.prev_centerline_bev) < 2:
+def draw_corridor_from_bev(vis, central_road, centerline_bev, bev: BEVProjector, cfg: Config, lane_info=None):
+    if centerline_bev is None or len(centerline_bev) < 2:
         return vis
 
     half_width_m = corridor_half_width_from_lane(lane_info, cfg)
     left_bev, right_bev = build_metric_corridor_edges(
-        st.prev_centerline_bev,
+        centerline_bev,
         half_width_m=half_width_m,
         meters_per_pixel_x=cfg.meters_per_pixel_x,
         meters_per_pixel_y=cfg.meters_per_pixel_y,
@@ -333,10 +488,9 @@ def corridor_from_previous_bev(vis, central_road, st: PlannerState, bev: BEVProj
     if left_bev is None or right_bev is None:
         return vis
 
-    center_img = bev.bev_to_image_points(st.prev_centerline_bev)
+    center_img = bev.bev_to_image_points(centerline_bev)
     left_img = bev.bev_to_image_points(left_bev)
     right_img = bev.bev_to_image_points(right_bev)
-    lead_box = focus_vehicle["box"] if focus_vehicle is not None else None
     vis = draw_projected_corridor(
         vis,
         center_img,
@@ -351,21 +505,15 @@ def corridor_from_previous_bev(vis, central_road, st: PlannerState, bev: BEVProj
         fill_alpha=cfg.corridor_alpha,
         max_step_px=cfg.projected_max_step_px,
         top_y_ratio=cfg.corridor_display_top_y_ratio,
-        lead_box=lead_box,
-        stop_margin_px=cfg.lead_vehicle_stop_margin_px,
-        min_points=cfg.projected_min_visible_points,
+        min_visible_points=cfg.projected_min_visible_points,
         fallback_centerline=cfg.render_fallback_centerline_when_polygon_fails,
     )
-    vis = draw_direction_arrow(
-        vis,
-        center_img,
-        color=cfg.best_path_text_color,
-        thickness=cfg.arrow_thickness_px,
-        top_y_ratio=cfg.corridor_display_top_y_ratio,
-        lead_box=lead_box,
-        stop_margin_px=cfg.lead_vehicle_stop_margin_px,
-    )
+    vis = draw_direction_arrow(vis, center_img, color=cfg.best_path_text_color, thickness=cfg.arrow_thickness_px)
     return vis
+
+
+def corridor_from_previous_bev(vis, central_road, st: PlannerState, bev: BEVProjector, cfg: Config, lane_info=None):
+    return draw_corridor_from_bev(vis, central_road, st.prev_centerline_bev, bev, cfg, lane_info=lane_info)
 
 
 def main():
@@ -447,14 +595,22 @@ def main():
                         "right_bev": st.prev_lane_right_bev,
                         "lane_mask_bev": None,
                         "relevance_mask_bev": None,
-                        "confidence": max(0.0, cfg.lane_min_confidence - 0.05),
+                        "confidence": max(0.0, cfg.lane_min_confidence - 0.04),
                         "lane_width_px": max(16.0, cfg.lane_width_m / max(1e-6, cfg.meters_per_pixel_x)),
+                        "has_markings": False,
                     }
                 else:
                     lane_info = None
 
         boxes_all = detector.detect(frame)
-        lane_relevance_mask_bev = lane_info.get("relevance_mask_bev") if lane_info is not None else None
+        lane_relevance_mask_bev = None
+        if (
+            lane_info is not None
+            and lane_info.get("confidence", 0.0) >= cfg.lane_boundary_trust_threshold
+            and lane_info.get("relevance_mask_bev") is not None
+        ):
+            lane_relevance_mask_bev = lane_info.get("relevance_mask_bev")
+
         relevant_boxes, _ = filter_relevant_boxes(
             boxes_all,
             detector.names,
@@ -465,8 +621,12 @@ def main():
             lane_relevance_mask_bev,
         )
 
-        obst_mask = detector.boxes_to_mask(relevant_boxes, (h, w))
-        plan_obst_raw = bev.warp_mask(obst_mask) if bev is not None else obst_mask
+        obst_overlay_mask = detector.boxes_to_mask(relevant_boxes, (h, w))
+        if bev is not None:
+            plan_obst_raw = boxes_to_bev_footprint_mask(relevant_boxes, (h, w), bev, cfg, road_mask_bev=road_plan_s)
+        else:
+            plan_obst_raw = boxes_to_image_footprint_mask(relevant_boxes, (h, w))
+
         st.prev_obst_prob = ema_prob(st.prev_obst_prob, plan_obst_raw, alpha=cfg.obstacle_ema_alpha)
         obst_plan_s = prob_to_mask(st.prev_obst_prob, thr=cfg.obstacle_prob_threshold)
 
@@ -481,7 +641,7 @@ def main():
 
         focus_vehicle = pick_focus_vehicle(relevant_boxes, detector.names, (h, w), cfg)
         blocking_obstacles = collect_blocking_obstacles(relevant_boxes, detector.names, (h, w), cfg, (gh, gw), bev=bev, cell=cell)
-        near_obstacle = obstacle_present_in_roi(obst_mask, cfg) or bool(blocking_obstacles)
+        near_obstacle = obstacle_present_in_roi(obst_overlay_mask, cfg) or bool(blocking_obstacles)
 
         lane_change_now = focus_vehicle is not None and focus_vehicle["bottom_gap_px"] <= cfg.lane_change_trigger_bottom_px
         if lane_change_now or near_obstacle:
@@ -524,80 +684,81 @@ def main():
         best_goal_c = None
         best_score = float("inf")
 
-        for gc in goal_cols:
-            goal = (goal_r, int(np.clip(gc, 0, gw - 1)))
-            path, cost = astar_weighted(
-                grid,
-                start,
-                goal,
-                clearance=clearance,
-                w_clear=cfg.astar_w_clear,
-                w_turn=cfg.astar_w_turn,
-                prev_dir=None,
-            )
-            if not path:
-                continue
+        if start is not None:
+            for gc in goal_cols:
+                goal = resolve_goal_cell(grid, goal_r, int(np.clip(gc, 0, gw - 1)), preferred_side, center_c, max_row_delta=18)
+                if goal is None:
+                    continue
+                path, cost = astar_weighted(
+                    grid,
+                    start,
+                    goal,
+                    clearance=clearance,
+                    w_clear=cfg.astar_w_clear,
+                    w_turn=cfg.astar_w_turn,
+                    prev_dir=None,
+                )
+                if not path:
+                    continue
 
-            path_clear = np.array([clearance[r, c] for (r, c) in path], dtype=np.float32)
-            mean_clear = float(path_clear.mean()) if path_clear.size else 0.0
-            low_clear_penalty = cfg.path_clearance_penalty / (mean_clear + 1.0)
+                path_clear = np.array([clearance[r, c] for (r, c) in path], dtype=np.float32)
+                mean_clear = float(path_clear.mean()) if path_clear.size else 0.0
+                low_clear_penalty = cfg.path_clearance_penalty / (mean_clear + 1.0)
 
-            continuity_pen = 0.0
-            if st.prev_goal_col is not None:
-                continuity_pen = cfg.goal_continuity_penalty * abs(gc - st.prev_goal_col)
+                continuity_pen = 0.0
+                if st.prev_goal_col is not None:
+                    continuity_pen = cfg.goal_continuity_penalty * abs(goal[1] - st.prev_goal_col)
 
-            obstacle_pen = 0.0
-            for obs in blocking_obstacles:
-                margin = obs["half_w_cells"] + cfg.obstacle_goal_margin_cells
-                rel = abs(gc - obs["grid_c"]) / float(max(1, margin))
-                obstacle_pen += cfg.obstacle_goal_penalty * obs["strength"] * max(0.0, 1.0 - rel)
+                obstacle_pen = 0.0
+                for obs in blocking_obstacles:
+                    margin = obs["half_w_cells"] + cfg.obstacle_goal_margin_cells
+                    rel = abs(goal[1] - obs["grid_c"]) / float(max(1, margin))
+                    obstacle_pen += cfg.obstacle_goal_penalty * obs["strength"] * max(0.0, 1.0 - rel)
 
-            side_pen = 0.0
-            side_name = path_side_name(gc, center_c, cfg.branch_label_deadband_cells)
-            if lane_change_active and preferred_side == "left":
-                if side_name == "CENTER":
-                    side_pen += cfg.center_goal_penalty
-                elif side_name == "RIGHT":
-                    side_pen += cfg.wrong_side_penalty
-            elif lane_change_active and preferred_side == "right":
-                if side_name == "CENTER":
-                    side_pen += cfg.center_goal_penalty
-                elif side_name == "LEFT":
-                    side_pen += cfg.wrong_side_penalty
+                side_pen = 0.0
+                side_name = path_side_name(goal[1], center_c, cfg.branch_label_deadband_cells)
+                if lane_change_active and preferred_side == "left":
+                    if side_name == "CENTER":
+                        side_pen += cfg.center_goal_penalty
+                    elif side_name == "RIGHT":
+                        side_pen += cfg.wrong_side_penalty
+                elif lane_change_active and preferred_side == "right":
+                    if side_name == "CENTER":
+                        side_pen += cfg.center_goal_penalty
+                    elif side_name == "LEFT":
+                        side_pen += cfg.wrong_side_penalty
 
-            lane_pen = 0.0
-            if target_lane_center is not None:
-                path_pts = path_to_points_px(path, cell)
-                lane_pen = lane_guidance_penalty(path_pts, target_lane_center, lane_width_px, weight=cfg.lane_center_penalty_weight)
+                lane_pen = 0.0
+                if target_lane_center is not None:
+                    path_pts = path_to_points_px(path, cell)
+                    lane_pen = lane_guidance_penalty(path_pts, target_lane_center, lane_width_px, weight=cfg.lane_center_penalty_weight)
 
-            score = cost + low_clear_penalty + continuity_pen + obstacle_pen + side_pen + lane_pen
-            if score < best_score:
-                best_score = score
-                best_path = path
-                best_goal_c = gc
-
-        if not best_path:
-            best_goal_c = center_c
-            best_path, _ = astar_weighted(
-                grid,
-                start,
-                (goal_r, best_goal_c),
-                clearance=clearance,
-                w_clear=cfg.astar_w_clear,
-                w_turn=cfg.astar_w_turn,
-                prev_dir=None,
-            )
+                score = cost + low_clear_penalty + continuity_pen + obstacle_pen + side_pen + lane_pen
+                if score < best_score:
+                    best_score = score
+                    best_path = path
+                    best_goal_c = goal[1]
 
         if best_goal_c is not None:
             st.prev_goal_col = best_goal_c
 
         vis = frame.copy()
         vis = overlay_mask(vis, central_road, cfg.road_mask_color, alpha=cfg.road_mask_alpha)
-        vis = overlay_mask(vis, obst_mask, cfg.obstacle_mask_color, alpha=cfg.obstacle_mask_alpha)
+        vis = overlay_mask(vis, obst_overlay_mask, cfg.obstacle_mask_color, alpha=cfg.obstacle_mask_alpha)
         vis = draw_boxes(vis, boxes_all, detector.names)
         vis = draw_focus_vehicle(vis, focus_vehicle if lane_change_active else None)
 
         pts_best = path_to_points_px(best_path, cell)
+        if pts_best is None or len(pts_best) < cfg.min_path_points:
+            pts_best = greedy_fallback_centerline(
+                grid,
+                start,
+                goal_r,
+                center_c,
+                preferred_side if lane_change_active else None,
+                cell,
+                samples=cfg.best_path_resample_points,
+            )
         path_valid = pts_best is not None and len(pts_best) >= cfg.min_path_points
 
         if path_valid and len(pts_best) >= 2:
@@ -626,49 +787,7 @@ def main():
                 pts_best = smooth_polyline(st.prev_centerline_bev, pts_best, alpha=cfg.centerline_smooth_alpha)
                 st.prev_centerline_bev = pts_best
                 st.corridor_miss_count = 0
-
-                half_width_m = corridor_half_width_from_lane(lane_info, cfg)
-                left_bev, right_bev = build_metric_corridor_edges(
-                    pts_best,
-                    half_width_m=half_width_m,
-                    meters_per_pixel_x=cfg.meters_per_pixel_x,
-                    meters_per_pixel_y=cfg.meters_per_pixel_y,
-                    out_hw=(cfg.bev_height, cfg.bev_width),
-                )
-
-                if left_bev is not None and right_bev is not None:
-                    center_img = bev.bev_to_image_points(pts_best)
-                    left_img = bev.bev_to_image_points(left_bev)
-                    right_img = bev.bev_to_image_points(right_bev)
-                    lead_box = focus_vehicle["box"] if focus_vehicle is not None else None
-                    vis = draw_projected_corridor(
-                        vis,
-                        center_img,
-                        left_img,
-                        right_img,
-                        road_mask=central_road if cfg.clip_best_corridor_to_road else None,
-                        fill_color=cfg.best_corridor_fill_color,
-                        edge_color=cfg.best_corridor_edge_color,
-                        center_color=cfg.best_corridor_center_color,
-                        edge_thickness=cfg.best_corridor_edge_thickness_px,
-                        center_thickness=cfg.best_corridor_center_thickness_px,
-                        fill_alpha=cfg.corridor_alpha,
-                        max_step_px=cfg.projected_max_step_px,
-                        top_y_ratio=cfg.corridor_display_top_y_ratio,
-                        lead_box=lead_box,
-                        stop_margin_px=cfg.lead_vehicle_stop_margin_px,
-                        min_points=cfg.projected_min_visible_points,
-                        fallback_centerline=cfg.render_fallback_centerline_when_polygon_fails,
-                    )
-                    vis = draw_direction_arrow(
-                        vis,
-                        center_img,
-                        color=cfg.best_path_text_color,
-                        thickness=cfg.arrow_thickness_px,
-                        top_y_ratio=cfg.corridor_display_top_y_ratio,
-                        lead_box=lead_box,
-                        stop_margin_px=cfg.lead_vehicle_stop_margin_px,
-                    )
+                vis = draw_corridor_from_bev(vis, central_road, pts_best, bev, cfg, lane_info=lane_info)
             else:
                 pts_best = limit_centerline_curvature(pts_best, max_dx_per_step=cfg.max_curve_dx_per_step_px)
                 pts_best = clamp_polyline_shift(pts_best, st.prev_centerline_img, max_shift_px=cfg.max_polyline_shift_px)
@@ -692,7 +811,7 @@ def main():
         else:
             st.corridor_miss_count += 1
             if bev is not None and st.corridor_miss_count <= cfg.corridor_hold_frames:
-                vis = corridor_from_previous_bev(vis, central_road, st, bev, cfg, lane_info=lane_info, focus_vehicle=focus_vehicle)
+                vis = corridor_from_previous_bev(vis, central_road, st, bev, cfg, lane_info=lane_info)
             elif st.prev_centerline_img is not None and len(st.prev_centerline_img) >= 2 and st.corridor_miss_count <= cfg.corridor_hold_frames:
                 vis = draw_guidance_corridor(
                     vis,
@@ -727,16 +846,20 @@ def main():
 
         if best_goal_c is not None:
             best_name = path_side_name(best_goal_c, center_c, deadband_cells=cfg.branch_label_deadband_cells)
-            cv2.putText(
-                vis,
-                "BEST PATH: " + best_name,
-                (15, 100),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.72,
-                cfg.best_path_text_color,
-                2,
-                cv2.LINE_AA,
-            )
+        elif preferred_side in ("left", "right"):
+            best_name = preferred_side.upper()
+        else:
+            best_name = "CENTER"
+        cv2.putText(
+            vis,
+            "BEST PATH: " + best_name,
+            (15, 100),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            cfg.best_path_text_color,
+            2,
+            cv2.LINE_AA,
+        )
 
         if lane_info is not None:
             cv2.putText(
